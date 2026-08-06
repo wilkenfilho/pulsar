@@ -26,6 +26,8 @@ for key, default in {
     "results_query": None,
     "results_columns": [],
     "results_df": None,
+    "folder_id": "25",
+    "folder_support": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -91,27 +93,31 @@ def unwrap_named_type(t):
     return cur
 
 
-def detect_categories():
-    type_query = """
-    query {
-      __type(name: "CreateBooleanTopicsSearchInput") {
-        inputFields {
+def introspect_input_fields(type_name):
+    query = f"""
+    query {{
+      __type(name: "{type_name}") {{
+        inputFields {{
           name
-          type {
+          type {{
             kind name
-            ofType { kind name
-              ofType { kind name
-                ofType { kind name
-                  ofType { kind name }
-                }
-              }
-            }
-          }
-        }
-      }
-    }"""
-    data = trac_gql(type_query)
-    input_fields = (data.get("__type") or {}).get("inputFields") or []
+            ofType {{ kind name
+              ofType {{ kind name
+                ofType {{ kind name
+                  ofType {{ kind name }}
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}"""
+    data = trac_gql(query)
+    return (data.get("__type") or {}).get("inputFields") or []
+
+
+def detect_categories():
+    input_fields = introspect_input_fields("CreateBooleanTopicsSearchInput")
     cat_field = next((f for f in input_fields if "categor" in f["name"].lower()), None)
     if not cat_field:
         raise RuntimeError("campo de categorias não encontrado no schema (introspection pode estar desabilitada).")
@@ -126,8 +132,130 @@ def detect_categories():
     return values
 
 
+# ---------------- folder support (schema-driven, nothing hardcoded) ----------------
+def detect_folder_support():
+    """Ask the TRAC metadata schema, in three different places, whether folders exist:
+    1) an arg on the `searches` query (e.g. folderId)
+    2) a standalone top-level query field (e.g. `folder`/`folders`)
+    3) a field on the Search type itself, for client-side filtering
+    4) an input field on CreateBooleanTopicsSearchInput, to assign new searches to a folder
+    """
+    info = {
+        "searches_arg": None,
+        "top_level_field": None,
+        "search_type_folder_field": None,
+        "create_input_field": None,
+        "raw_query_fields": [],
+    }
+    fields = introspect_query_fields(TRAC_ENDPOINT)
+    info["raw_query_fields"] = [f["name"] for f in fields]
+
+    searches_field = next((f for f in fields if f["name"] == "searches"), None)
+    if searches_field:
+        for a in searches_field["args"]:
+            if "folder" in a["name"].lower():
+                info["searches_arg"] = a["name"]
+                break
+
+        named = unwrap_named_type(searches_field["type"])
+        if named.get("name"):
+            result_type = introspect_type_fields(TRAC_ENDPOINT, named["name"])
+            nodes_field = next((f for f in (result_type.get("fields") or []) if f["name"] == "nodes"), None)
+            if nodes_field:
+                node_named = unwrap_named_type(nodes_field["type"])
+                if node_named.get("name"):
+                    node_type = introspect_type_fields(TRAC_ENDPOINT, node_named["name"])
+                    folder_field = next(
+                        (f for f in (node_type.get("fields") or []) if "folder" in f["name"].lower()), None
+                    )
+                    if folder_field:
+                        info["search_type_folder_field"] = folder_field["name"]
+
+    top_field = next((f for f in fields if "folder" in f["name"].lower()), None)
+    if top_field:
+        info["top_level_field"] = top_field["name"]
+
+    create_fields = introspect_input_fields("CreateBooleanTopicsSearchInput")
+    folder_input = next((f for f in create_fields if "folder" in f["name"].lower()), None)
+    if folder_input:
+        info["create_input_field"] = folder_input["name"]
+
+    return info
+
+
+def fetch_folder_searches(folder_field_name, folder_id):
+    """Follow Query.<folder_field_name>(id) -> find its nested searches-like connection -> flatten to a list of dicts."""
+    fields = introspect_query_fields(TRAC_ENDPOINT)
+    folder_field = next(f for f in fields if f["name"] == folder_field_name)
+    id_arg = next((a["name"] for a in folder_field["args"] if a["name"].lower() in ("id", "folderid")), None)
+    if not id_arg:
+        id_arg = folder_field["args"][0]["name"] if folder_field["args"] else "id"
+
+    folder_named = unwrap_named_type(folder_field["type"])
+    folder_type = introspect_type_fields(TRAC_ENDPOINT, folder_named["name"])
+    folder_fields = folder_type.get("fields") or []
+
+    conn_field = next(
+        (f for f in folder_fields if any(k in f["name"].lower() for k in ("search", "topic", "item", "content"))),
+        None,
+    )
+    if not conn_field:
+        raise RuntimeError(
+            f'o tipo "{folder_named["name"]}" não expõe um campo óbvio de buscas '
+            f'(campos disponíveis: {", ".join(f["name"] for f in folder_fields)}).'
+        )
+
+    conn_named = unwrap_named_type(conn_field["type"])
+    conn_type = introspect_type_fields(TRAC_ENDPOINT, conn_named["name"]) if conn_named.get("name") else {}
+    conn_type_fields = conn_type.get("fields") or []
+    nodes_field = next((f for f in conn_type_fields if f["name"] in ("nodes", "edges", "items", "results")), None)
+
+    preferred = {"id", "name", "totalContents", "startDate", "status", "searchHash", "realtimeStatus"}
+
+    if nodes_field:
+        node_named = unwrap_named_type(nodes_field["type"])
+        node_type = introspect_type_fields(TRAC_ENDPOINT, node_named["name"])
+        node_fields = node_type.get("fields") or []
+        leaf_names = [f["name"] for f in node_fields if unwrap_named_type(f["type"]).get("kind") in LEAF_KINDS]
+        selection_fields = [n for n in leaf_names if n in preferred] or leaf_names[:10]
+        selection = "\n            ".join(selection_fields)
+        query = f"""
+        query FolderSearches($id: ID!) {{
+          {folder_field_name}({id_arg}: $id) {{
+            {conn_field["name"]} {{
+              {nodes_field["name"]} {{
+                {selection}
+              }}
+            }}
+          }}
+        }}"""
+        data = trac_gql(query, {"id": str(folder_id)})
+        root = data[folder_field_name][conn_field["name"]][nodes_field["name"]]
+        if nodes_field["name"] == "edges":
+            root = [e["node"] for e in root]
+        return root
+    else:
+        leaf_names = [f["name"] for f in conn_type_fields if unwrap_named_type(f["type"]).get("kind") in LEAF_KINDS]
+        selection_fields = [n for n in leaf_names if n in preferred] or leaf_names[:10]
+        selection = "\n          ".join(selection_fields)
+        query = f"""
+        query FolderSearches($id: ID!) {{
+          {folder_field_name}({id_arg}: $id) {{
+            {conn_field["name"]} {{
+              {selection}
+            }}
+          }}
+        }}"""
+        data = trac_gql(query, {"id": str(folder_id)})
+        root = data[folder_field_name][conn_field["name"]]
+        return root if isinstance(root, list) else [root]
+
+
 # ---------------- TRAC metadata mutations ----------------
-def create_search(name, categories, boolean_expr):
+def create_search(name, categories, boolean_expr, folder_input_field=None, folder_id=None):
+    input_obj = {"name": name, "categories": categories, "booleanExpression": boolean_expr}
+    if folder_input_field and folder_id:
+        input_obj[folder_input_field] = folder_id
     mutation = """
     mutation CreateBoolTopic($input: CreateBooleanTopicsSearchInput!){
       createBooleanTopicsSearch(input:$input){
@@ -135,7 +263,7 @@ def create_search(name, categories, boolean_expr):
         errors{ id message extensions }
       }
     }"""
-    data = trac_gql(mutation, {"input": {"name": name, "categories": categories, "booleanExpression": boolean_expr}})
+    data = trac_gql(mutation, {"input": input_obj})
     result = data["createBooleanTopicsSearch"]
     if result.get("errors"):
         raise RuntimeError(" | ".join(friendly_error(e["message"]) for e in result["errors"]))
@@ -201,16 +329,40 @@ def stop_search(search_id):
         raise RuntimeError(" | ".join(friendly_error(e["message"]) for e in errors))
 
 
-def list_searches():
-    query = """
-    query Searches($sortBy: AllowedFieldsForSorting){
-      searches(sortBy:$sortBy){
+def list_searches(folder_support=None, folder_id=None):
+    var_defs = "$sortBy: AllowedFieldsForSorting"
+    args = "sortBy:$sortBy"
+    variables = {"sortBy": "NAME"}
+    extra_field = ""
+
+    if folder_support and folder_support.get("searches_arg") and folder_id:
+        arg_name = folder_support["searches_arg"]
+        var_defs += f", ${arg_name}: ID"
+        args += f", {arg_name}:${arg_name}"
+        variables[arg_name] = str(folder_id)
+    elif folder_support and folder_support.get("search_type_folder_field"):
+        extra_field = folder_support["search_type_folder_field"]
+
+    query = f"""
+    query Searches({var_defs}){{
+      searches({args}){{
         totalCount
-        nodes{ id name totalContents startDate status searchHash realtimeStatus }
-      }
-    }"""
-    data = trac_gql(query, {"sortBy": "NAME"})
-    return data["searches"]["nodes"]
+        nodes{{ id name totalContents startDate status searchHash realtimeStatus {extra_field} }}
+      }}
+    }}"""
+    data = trac_gql(query, variables)
+    nodes = data["searches"]["nodes"]
+
+    if (
+        folder_id
+        and folder_support
+        and not folder_support.get("searches_arg")
+        and folder_support.get("search_type_folder_field")
+    ):
+        key = folder_support["search_type_folder_field"]
+        nodes = [n for n in nodes if str(n.get(key)) == str(folder_id)]
+
+    return nodes
 
 
 def iso_start(d):
@@ -262,14 +414,65 @@ def introspect_type_fields(endpoint, type_name):
 
 
 LEAF_KINDS = {"SCALAR", "ENUM"}
+BAD_FIELD_HINTS = ("check", "shareable", "share", "validate", "verify", "exists")
+GOOD_FIELD_HINTS = ("content", "post", "result", "mention", "message", "trac")
+SEARCH_ARG_HINTS = ("searchhash", "searchid", "hash", "topicid")
 
 
-def find_results_field_candidates(fields):
-    keywords = ("content", "post", "result", "trac", "record", "item")
-    return [f for f in fields if any(k in f["name"].lower() for k in keywords)]
+def score_results_field(endpoint, f):
+    """Rank a Query field by how likely it is to be 'give me all the posts for a search',
+    as opposed to a single-item lookup like checkShareableContent(contentId)."""
+    name = f["name"].lower()
+    arg_names = [a["name"].lower() for a in f["args"]]
+    score = 0
+
+    if any(k in name for k in GOOD_FIELD_HINTS):
+        score += 3
+    if any(k in name for k in BAD_FIELD_HINTS):
+        score -= 6
+    if any(any(h in a for h in SEARCH_ARG_HINTS) for a in arg_names):
+        score += 3
+    if len(f["args"]) == 1 and "content" in arg_names[0] and "id" in arg_names[0]:
+        score -= 4  # single-content-by-id lookup pattern, not a bulk listing
+
+    try:
+        named = unwrap_named_type(f["type"])
+        if f["type"].get("kind") == "LIST" or (named.get("kind") == "OBJECT"):
+            result_type = introspect_type_fields(endpoint, named["name"]) if named.get("name") else {}
+            rfields = [x["name"] for x in (result_type.get("fields") or [])]
+            if any(x in rfields for x in ("nodes", "edges", "totalCount", "items", "results")):
+                score += 4
+            elif rfields:
+                score -= 2  # looks like a single flat object, not a collection
+    except Exception:
+        pass
+
+    return score
 
 
-def build_dynamic_query(endpoint, field_name, arg_values):
+def rank_results_fields(endpoint, fields):
+    candidates = [f for f in fields if any(k in f["name"].lower() for k in GOOD_FIELD_HINTS)]
+    if not candidates:
+        candidates = fields
+    scored = [(score_results_field(endpoint, f), f) for f in candidates]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [f for _, f in scored]
+
+
+def pick_identifier_arg(field_info, search):
+    """Find the arg most likely meant to receive the search's id/hash, and the value to send."""
+    for a in field_info["args"]:
+        low = a["name"].lower()
+        if "hash" in low:
+            return a["name"], search["searchHash"]
+    for a in field_info["args"]:
+        low = a["name"].lower()
+        if "search" in low or low == "id" or low == "topicid":
+            return a["name"], search["id"]
+    return None, None
+
+
+def build_dynamic_query(endpoint, field_name, arg_values, field_cap=300):
     field_info = next(f for f in introspect_query_fields(endpoint) if f["name"] == field_name)
     return_named = unwrap_named_type(field_info["type"])
     result_type = introspect_type_fields(endpoint, return_named["name"])
@@ -279,7 +482,6 @@ def build_dynamic_query(endpoint, field_name, arg_values):
     if nodes_field:
         node_named = unwrap_named_type(nodes_field["type"])
         if node_named["name"] and (result_type.get("kind") != "SCALAR"):
-            # if edges (relay style), go one level deeper to "node"
             inner_type = introspect_type_fields(endpoint, node_named["name"])
             inner_fields = inner_type.get("fields") or []
             has_node = next((f for f in inner_fields if f["name"] == "node"), None)
@@ -290,7 +492,7 @@ def build_dynamic_query(endpoint, field_name, arg_values):
         else:
             inner_fields = []
         leaf_fields = [f["name"] for f in inner_fields if unwrap_named_type(f["type"]).get("kind") in LEAF_KINDS]
-        leaf_fields = leaf_fields[:60] or ["id"]
+        leaf_fields = leaf_fields[:field_cap] or ["id"]
         args_str = ", ".join(f"{k}: ${k}" for k in arg_values.keys())
         var_defs = ", ".join(f"${k}: {v['gql_type']}" for k, v in arg_values.items())
         selection = "\n      ".join(leaf_fields)
@@ -305,9 +507,8 @@ def build_dynamic_query(endpoint, field_name, arg_values):
         }}"""
         return query, nodes_field["name"]
     else:
-        # field returns a flat list directly
         leaf_fields = [f["name"] for f in (result_type.get("fields") or []) if unwrap_named_type(f["type"]).get("kind") in LEAF_KINDS]
-        leaf_fields = leaf_fields[:60] or ["id"]
+        leaf_fields = leaf_fields[:field_cap] or ["id"]
         args_str = ", ".join(f"{k}: ${k}" for k in arg_values.keys())
         var_defs = ", ".join(f"${k}: {v['gql_type']}" for k, v in arg_values.items())
         selection = "\n      ".join(leaf_fields)
@@ -329,6 +530,34 @@ def flatten_results(payload, field_name, nodes_key):
     else:
         items = root if isinstance(root, list) else [root]
     return pd.DataFrame(items)
+
+
+def fetch_all_results_auto(search):
+    """Try the best-ranked candidate fields in order until one returns data successfully."""
+    fields = introspect_query_fields(DATA_ENDPOINT)
+    ranked = rank_results_fields(DATA_ENDPOINT, fields)
+    attempts = []
+    for field_info in ranked[:5]:
+        arg_name, arg_value = pick_identifier_arg(field_info, search)
+        if not arg_name:
+            attempts.append((field_info["name"], "nenhum argumento parece aceitar o id/hash da busca — pulado"))
+            continue
+        gql_type = "String"
+        for a in field_info["args"]:
+            if a["name"] == arg_name:
+                named = unwrap_named_type(a["type"])
+                gql_type = (named.get("name") or "String") + ("!" if a["type"].get("kind") == "NON_NULL" else "")
+        arg_values = {arg_name: {"value": arg_value, "gql_type": gql_type}}
+        try:
+            query, nodes_key = build_dynamic_query(DATA_ENDPOINT, field_info["name"], arg_values)
+            payload = data_gql(query, {arg_name: arg_value})
+            df = flatten_results(payload, field_info["name"], nodes_key)
+            if not df.empty:
+                return df, field_info["name"], attempts
+            attempts.append((field_info["name"], "retornou 0 registros"))
+        except Exception as e:
+            attempts.append((field_info["name"], str(e)))
+    return pd.DataFrame(), None, attempts
 
 
 # ---------------- text mining helpers (for word cloud / emoji / correlation) ----------------
@@ -398,10 +627,56 @@ with tab_config:
             st.error(f"Erro: {e}")
     st.write("Lista atual:", ", ".join(st.session_state.categories))
 
+    st.divider()
+    st.subheader("Pasta de trabalho")
+    st.caption(
+        "A pasta não aparece na documentação pública do endpoint de metadados. "
+        "O app pergunta ao schema onde esse conceito existe (filtro na listagem, campo próprio, ou "
+        "campo no próprio objeto de busca) antes de aplicar qualquer filtro."
+    )
+    st.session_state.folder_id = st.text_input(
+        "ID da pasta (ex: 25, da URL .../trac/folders/25)", value=st.session_state.folder_id
+    )
+    if st.button("🔎 Detectar suporte a pastas no schema"):
+        try:
+            with st.spinner("Consultando schema..."):
+                info = detect_folder_support()
+            st.session_state.folder_support = info
+            found = any([info["searches_arg"], info["top_level_field"], info["search_type_folder_field"], info["create_input_field"]])
+            if found:
+                st.success("Suporte a pastas encontrado no schema.")
+            else:
+                st.warning(
+                    "Não achei nada com 'folder' no nome em nenhum dos 4 lugares checados. "
+                    "Pode estar com outro nome (ex: 'group', 'workspace', 'project')."
+                )
+            with st.expander("Detalhes da detecção"):
+                st.json(info)
+        except Exception as e:
+            st.error(f"Erro: {e}")
+
+    fs = st.session_state.folder_support
+    if fs:
+        st.caption(
+            f"searches(arg)={fs['searches_arg']} · campo próprio={fs['top_level_field']} · "
+            f"campo no objeto de busca={fs['search_type_folder_field']} · campo de criação={fs['create_input_field']}"
+        )
+
 # ---- Nova busca ----
 with tab_new:
     if not st.session_state.token:
         st.warning("Cole seu token na aba Configurações antes de continuar.")
+
+    fs_preview = st.session_state.folder_support
+    if fs_preview and fs_preview.get("create_input_field"):
+        st.caption(f"✅ Novas buscas serão criadas direto na pasta {st.session_state.folder_id}.")
+    elif fs_preview:
+        st.caption(
+            "⚠️ O schema não expõe um campo para atribuir pasta na criação — a busca nasce sem pasta "
+            "e você precisará movê-la manualmente no Pulsar Platform."
+        )
+    else:
+        st.caption('Detecte o suporte a pastas na aba "⚙️ Configurações" para saber se dá pra criar já dentro da pasta 25.')
 
     name = st.text_input("Nome da busca", placeholder="ex: Cripto - Monitoramento Ago")
     auto_suffix = st.checkbox("Adicionar sufixo automático para evitar nomes duplicados", value=True)
@@ -434,10 +709,18 @@ with tab_new:
             st.error("Preencha nome, booleana e ao menos uma rede.")
         else:
             final_name = f"{name} — {datetime.now():%Y-%m-%d %H:%M:%S}" if auto_suffix else name
+            fs = st.session_state.folder_support
+            folder_field = fs.get("create_input_field") if fs else None
             progress = st.status("Rodando busca...", expanded=True)
             try:
-                progress.write(f"Criando busca (\"{final_name}\")...")
-                search = create_search(final_name, networks, boolean_expr)
+                if folder_field:
+                    progress.write(f'Criando busca ("{final_name}") na pasta {st.session_state.folder_id}...')
+                else:
+                    progress.write(f"Criando busca (\"{final_name}\")...")
+                search = create_search(
+                    final_name, networks, boolean_expr,
+                    folder_input_field=folder_field, folder_id=st.session_state.folder_id,
+                )
                 progress.write(f"✅ Busca criada — hash `{search['searchHash']}`")
 
                 historic_launched = False
@@ -490,9 +773,23 @@ with tab_list:
     if not st.session_state.token:
         st.warning("Cole seu token na aba Configurações antes de continuar.")
     else:
+        fs = st.session_state.folder_support
+        restrict = st.checkbox(f"Mostrar só a pasta {st.session_state.folder_id}", value=True)
+
         if st.button("🔄 Atualizar lista"):
             try:
-                st.session_state.searches = list_searches()
+                if restrict and fs and fs.get("top_level_field"):
+                    with st.spinner(f"Buscando pasta {st.session_state.folder_id} via {fs['top_level_field']}..."):
+                        st.session_state.searches = fetch_folder_searches(fs["top_level_field"], st.session_state.folder_id)
+                elif restrict and fs and (fs.get("searches_arg") or fs.get("search_type_folder_field")):
+                    st.session_state.searches = list_searches(folder_support=fs, folder_id=st.session_state.folder_id)
+                else:
+                    if restrict:
+                        st.info(
+                            'Ainda não detectei suporte a pastas — mostrando todas as buscas. '
+                            'Rode "Detectar suporte a pastas" na aba Configurações.'
+                        )
+                    st.session_state.searches = list_searches()
             except Exception as e:
                 st.error(str(e))
 
@@ -514,7 +811,12 @@ with tab_list:
                         try:
                             stop_search(s["id"])
                             st.success("Parado.")
-                            st.session_state.searches = list_searches()
+                            if restrict and fs and fs.get("top_level_field"):
+                                st.session_state.searches = fetch_folder_searches(fs["top_level_field"], st.session_state.folder_id)
+                            elif restrict and fs and (fs.get("searches_arg") or fs.get("search_type_folder_field")):
+                                st.session_state.searches = list_searches(folder_support=fs, folder_id=st.session_state.folder_id)
+                            else:
+                                st.session_state.searches = list_searches()
                             st.rerun()
                         except Exception as e:
                             st.error(str(e))
@@ -524,72 +826,53 @@ with tab_results:
     if not st.session_state.token:
         st.warning("Cole seu token na aba Configurações antes de continuar.")
     else:
-        st.subheader("1. Descobrir o campo de resultados")
-        st.caption(
-            "O Data Endpoint (data.pulsarplatform.com/graphql/trac) não tem schema público documentado, "
-            "então o app pergunta ao próprio GraphQL quais campos existem — em vez de eu chutar nomes."
-        )
-        if st.button("🔬 Descobrir campos no Data Endpoint"):
+        st.subheader("1. Escolha o estudo")
+        if not st.session_state.searches:
+            fs = st.session_state.folder_support
             try:
-                with st.spinner("Consultando schema do Data Endpoint..."):
-                    fields = introspect_query_fields(DATA_ENDPOINT)
-                candidates = find_results_field_candidates(fields)
-                st.session_state.field_candidates = candidates or fields
-                st.success(f"{len(st.session_state.field_candidates)} campo(s) candidato(s) encontrado(s).")
-            except Exception as e:
-                st.error(f"Erro na introspection: {e}")
-
-        candidates = st.session_state.get("field_candidates", [])
-        if candidates:
-            names = [f["name"] for f in candidates]
-            chosen = st.selectbox("Campo de resultados a usar", names)
-            field_info = next(f for f in candidates if f["name"] == chosen)
-            arg_names = [a["name"] for a in field_info["args"]]
-            st.caption(f"Argumentos deste campo: {', '.join(arg_names) if arg_names else '(nenhum)'}")
-
-            st.subheader("2. Selecionar busca e período")
-            if not st.session_state.searches:
-                try:
-                    st.session_state.searches = list_searches()
-                except Exception as e:
-                    st.error(str(e))
-            search_options = {f"{s['name']} — {s['searchHash']}": s for s in st.session_state.searches}
-            picked_label = st.selectbox("Busca", list(search_options.keys())) if search_options else None
-            picked = search_options.get(picked_label) if picked_label else None
-
-            arg_values = {}
-            for a in field_info["args"]:
-                gql_type_ref = a["type"]
-                named = unwrap_named_type(gql_type_ref)
-                type_str = named.get("name") or "String"
-                is_id_like = any(k in a["name"].lower() for k in ("id", "hash", "search"))
-                if is_id_like and picked:
-                    default_val = picked["id"] if "id" in a["name"].lower() else picked["searchHash"]
-                    val = st.text_input(f"Arg: {a['name']} ({type_str})", value=str(default_val), key=f"arg-{a['name']}")
+                if fs and (fs.get("searches_arg") or fs.get("search_type_folder_field")):
+                    st.session_state.searches = list_searches(folder_support=fs, folder_id=st.session_state.folder_id)
+                elif fs and fs.get("top_level_field"):
+                    st.session_state.searches = fetch_folder_searches(fs["top_level_field"], st.session_state.folder_id)
                 else:
-                    val = st.text_input(f"Arg: {a['name']} ({type_str})", value="", key=f"arg-{a['name']}")
-                if val:
-                    arg_values[a["name"]] = {"value": val, "gql_type": type_str if gql_type_ref.get("kind") == "NON_NULL" else type_str}
+                    st.session_state.searches = list_searches()
+            except Exception as e:
+                st.error(str(e))
 
-            if st.button("📥 Buscar resultados", type="primary"):
-                try:
-                    with st.spinner("Montando query dinâmica e buscando..."):
-                        query, nodes_key = build_dynamic_query(DATA_ENDPOINT, chosen, arg_values)
-                        variables = {k: v["value"] for k, v in arg_values.items()}
-                        payload = data_gql(query, variables)
-                        df = flatten_results(payload, chosen, nodes_key)
+        def _label(s):
+            nm = s.get("name") or f"(sem nome) {s.get('searchHash', s.get('id', '?'))}"
+            return f"{nm} — {s.get('searchHash', '')}"
+
+        search_options = {_label(s): s for s in st.session_state.searches}
+        if st.button("🔄 Recarregar lista de estudos"):
+            st.session_state.searches = []
+            st.rerun()
+
+        picked_label = st.selectbox("Estudo", list(search_options.keys())) if search_options else None
+        picked = search_options.get(picked_label) if picked_label else None
+
+        if picked and st.button("📥 Puxar TUDO desse estudo", type="primary"):
+            try:
+                with st.spinner("Descobrindo o melhor campo e buscando todos os campos disponíveis..."):
+                    df, used_field, attempts = fetch_all_results_auto(picked)
+                if df.empty:
+                    st.error("Não consegui trazer resultados automaticamente.")
+                    with st.expander("O que foi tentado"):
+                        for fname, msg in attempts:
+                            st.write(f"**{fname}**: {msg}")
+                    st.caption("Me manda essa lista que eu ajusto a lógica de escolha de campo.")
+                else:
                     st.session_state.results_df = df
-                    st.session_state.results_query = query
-                    st.success(f"{len(df)} registro(s) carregado(s).")
-                except Exception as e:
-                    st.error(str(e))
-                    if st.session_state.get("results_query") is None:
-                        st.caption("Se o erro for de campo desconhecido, tente outro campo candidato acima.")
+                    st.session_state.results_field_used = used_field
+                    st.success(f"{len(df)} registro(s) carregado(s) via `{used_field}`, com {len(df.columns)} coluna(s).")
+            except Exception as e:
+                st.error(str(e))
+
 
         df = st.session_state.get("results_df")
         if df is not None and not df.empty:
             st.divider()
-            st.subheader("3. Planilha")
+            st.subheader("2. Planilha")
             st.dataframe(df, use_container_width=True)
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -597,7 +880,7 @@ with tab_results:
             st.download_button("⬇️ Baixar como Excel", buf.getvalue(), file_name="pulsar_resultados.xlsx")
 
             st.divider()
-            st.subheader("4. Mapear colunas para os gráficos")
+            st.subheader("3. Mapear colunas para os gráficos")
             cols = list(df.columns)
 
             def guess(keywords, default_idx=0):
@@ -614,7 +897,7 @@ with tab_results:
             network_col = c4.selectbox("Coluna de rede (opcional)", ["(nenhuma)"] + cols)
 
             st.divider()
-            st.subheader("5. Dashboard")
+            st.subheader("4. Dashboard")
 
             g1, g2 = st.columns(2)
 
