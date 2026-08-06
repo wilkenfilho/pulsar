@@ -93,7 +93,8 @@ def unwrap_named_type(t):
     return cur
 
 
-def introspect_input_fields(type_name):
+def introspect_input_fields(type_name, endpoint=None):
+    endpoint = endpoint or TRAC_ENDPOINT
     query = f"""
     query {{
       __type(name: "{type_name}") {{
@@ -112,7 +113,7 @@ def introspect_input_fields(type_name):
         }}
       }}
     }}"""
-    data = trac_gql(query)
+    data = gql(endpoint, query)
     return (data.get("__type") or {}).get("inputFields") or []
 
 
@@ -373,6 +374,65 @@ def iso_end(d):
     return f"{d.isoformat()}T23:59:59Z" if d else None
 
 
+# ---------------- advanced boolean operators (TRAC Full Boolean Operator Guide) ----------------
+def build_boolean_expression(base_expr, adv):
+    """Wrap the user's plain-language boolean and silently AND-in the advanced operators
+    the person picked in 'Configurações avançadas' — they never see this raw syntax."""
+    parts = [f"({base_expr.strip()})"] if base_expr.strip() else []
+
+    if adv.get("not_rt"):
+        parts.append("NOT RT")
+    if adv.get("not_quote"):
+        parts.append("NOT QUOTE")
+    if adv.get("not_reply"):
+        parts.append("NOT REPLY")
+
+    rt_of_exclude = [h.strip() for h in adv.get("not_rt_of", "").split(",") if h.strip()]
+    if rt_of_exclude:
+        parts.append(f"NOT RT_OF({' OR '.join(_at(h) for h in rt_of_exclude)})")
+
+    by_twitter = [h.strip() for h in adv.get("by_twitter", "").split(",") if h.strip()]
+    if by_twitter:
+        parts.append(f"BY_TWITTER({' OR '.join(_at(h) for h in by_twitter)})")
+
+    not_by_twitter = [h.strip() for h in adv.get("not_by_twitter", "").split(",") if h.strip()]
+    if not_by_twitter:
+        parts.append(f"NOT BY_TWITTER({' OR '.join(_at(h) for h in not_by_twitter)})")
+
+    sites = [s.strip() for s in adv.get("not_site", "").split(",") if s.strip()]
+    if sites:
+        parts.append(f"NOT SITE({' OR '.join(sites)})")
+
+    langs = [l.strip() for l in adv.get("langs", "").split(",") if l.strip()]
+    if langs:
+        parts.append(f"LANG({' OR '.join(langs)})")
+
+    if adv.get("location"):
+        parts.append(f"LOCATION({adv['location'].strip()})")
+
+    media = adv.get("media") or []
+    if media:
+        parts.append(f"MEDIA({' OR '.join(media)})")
+
+    if adv.get("sample"):
+        parts.append(f"SAMPLE {int(adv['sample'])}")
+
+    if adv.get("pinterest"):
+        parts.append(f"PINTEREST ({base_expr.strip()})")
+    if adv.get("twitch"):
+        parts.append(f"TWITCH ({base_expr.strip()})")
+
+    if adv.get("extra"):
+        parts.append(adv["extra"].strip())
+
+    return " AND ".join(p for p in parts if p)
+
+
+def _at(handle):
+    handle = handle.strip()
+    return handle if handle.startswith("@") else f"@{handle}"
+
+
 # ---------------- Data Endpoint discovery (introspection-driven, no guessed field names) ----------------
 def introspect_query_fields(endpoint):
     query = """
@@ -459,17 +519,59 @@ def rank_results_fields(endpoint, fields):
     return [f for _, f in scored]
 
 
+ID_HINTS_RE = ("hash", "search", "topic")
+
+
+def _looks_like_identifier(name_lower):
+    if any(h in name_lower for h in ID_HINTS_RE):
+        return True
+    return name_lower in ("id", "ids") or name_lower.endswith("id") or name_lower.endswith("ids")
+
+
 def pick_identifier_arg(field_info, search):
-    """Find the arg most likely meant to receive the search's id/hash, and the value to send."""
+    """Direct scalar/enum arg on the field itself that looks like it wants the search's id/hash."""
     for a in field_info["args"]:
         low = a["name"].lower()
         if "hash" in low:
             return a["name"], search["searchHash"]
     for a in field_info["args"]:
         low = a["name"].lower()
-        if "search" in low or low == "id" or low == "topicid":
+        if _looks_like_identifier(low):
             return a["name"], search["id"]
     return None, None
+
+
+def resolve_identifier(endpoint, field_info, search):
+    """Find how to pass the search's id/hash to this field: either a direct scalar arg,
+    or a field nested inside an INPUT_OBJECT arg (a common 'filter: {...}' pattern).
+    Returns (arg_name, gql_type, value, nested_field_name_or_None).
+    """
+    arg_name, value = pick_identifier_arg(field_info, search)
+    if arg_name:
+        for a in field_info["args"]:
+            if a["name"] == arg_name:
+                named = unwrap_named_type(a["type"])
+                gql_type = (named.get("name") or "ID") + ("!" if a["type"].get("kind") == "NON_NULL" else "")
+                return arg_name, gql_type, value, None
+
+    for a in field_info["args"]:
+        named = unwrap_named_type(a["type"])
+        if named.get("kind") == "INPUT_OBJECT" and named.get("name"):
+            try:
+                input_fields = introspect_input_fields(named["name"], endpoint=endpoint)
+            except Exception:
+                continue
+            for f in input_fields:
+                low = f["name"].lower()
+                if "hash" in low:
+                    gql_type = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
+                    return a["name"], gql_type, {f["name"]: search["searchHash"]}, named["name"]
+            for f in input_fields:
+                low = f["name"].lower()
+                if _looks_like_identifier(low):
+                    gql_type = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
+                    return a["name"], gql_type, {f["name"]: search["id"]}, named["name"]
+    return None, None, None, None
 
 
 def build_dynamic_query(endpoint, field_name, arg_values, field_cap=300):
@@ -537,16 +639,11 @@ def fetch_all_results_auto(search):
     fields = introspect_query_fields(DATA_ENDPOINT)
     ranked = rank_results_fields(DATA_ENDPOINT, fields)
     attempts = []
-    for field_info in ranked[:5]:
-        arg_name, arg_value = pick_identifier_arg(field_info, search)
+    for field_info in ranked[:8]:
+        arg_name, gql_type, arg_value, nested_field = resolve_identifier(DATA_ENDPOINT, field_info, search)
         if not arg_name:
-            attempts.append((field_info["name"], "nenhum argumento parece aceitar o id/hash da busca — pulado"))
+            attempts.append((field_info["name"], "nenhum argumento (direto ou aninhado) parece aceitar o id/hash da busca — pulado"))
             continue
-        gql_type = "String"
-        for a in field_info["args"]:
-            if a["name"] == arg_name:
-                named = unwrap_named_type(a["type"])
-                gql_type = (named.get("name") or "String") + ("!" if a["type"].get("kind") == "NON_NULL" else "")
         arg_values = {arg_name: {"value": arg_value, "gql_type": gql_type}}
         try:
             query, nodes_key = build_dynamic_query(DATA_ENDPOINT, field_info["name"], arg_values)
@@ -704,6 +801,34 @@ with tab_new:
             "Fim do tempo real (deixe em branco para rodar indefinidamente)", value=None, key="rt_end"
         )
 
+    with st.expander("⚙️ Configurações avançadas (operadores booleanos)"):
+        st.caption(
+            "Essas opções viram operadores do "
+            "[TRAC Full Boolean Operator Guide](https://intercom.help/pulsar/en/articles/6976653-trac-full-boolean-operator-guide) "
+            "e são coladas na booleana por baixo dos panos — você não precisa escrever a sintaxe."
+        )
+        c1, c2, c3 = st.columns(3)
+        adv_not_rt = c1.checkbox("Excluir retweets")
+        adv_not_quote = c2.checkbox("Excluir citações (quotes)")
+        adv_not_reply = c3.checkbox("Excluir respostas (replies)")
+
+        adv_by_twitter = st.text_input("Somente destes perfis do X/Twitter (separados por vírgula)", placeholder="@marca, @concorrente")
+        adv_not_by_twitter = st.text_input("Excluir estes perfis do X/Twitter", placeholder="@spamconta")
+        adv_not_rt_of = st.text_input("Excluir retweets destes perfis", placeholder="@perfil1, @perfil2")
+        adv_not_site = st.text_input("Excluir estes sites (NOT SITE)", placeholder="amazon.com, mercadolivre.com.br")
+        adv_langs = st.text_input("Restringir a estes idiomas (LANG)", placeholder="pt, en")
+        adv_location = st.text_input("Restringir a esta localização (LOCATION)", placeholder="BR OR US")
+        adv_media = st.multiselect("Restringir a este tipo de mídia (MEDIA)", ["videos", "images"])
+        adv_sample = st.number_input("Amostragem (SAMPLE, % opcional)", min_value=0, max_value=100, value=0, step=5)
+        c4, c5 = st.columns(2)
+        adv_pinterest = c4.checkbox("Também rodar como busca PINTEREST dedicada")
+        adv_twitch = c5.checkbox("Também rodar como busca TWITCH dedicada")
+        adv_extra = st.text_area(
+            "Operadores extras (avançado — cole a sintaxe direto)",
+            placeholder='ex: (cat OR dog) NEAR/5 (food OR toy)   |   space* AND (elon OR nasa)',
+            height=70,
+        )
+
     if st.button("🚀 Rodar busca completa", type="primary"):
         if not (name and boolean_expr and networks):
             st.error("Preencha nome, booleana e ao menos uma rede.")
@@ -711,14 +836,25 @@ with tab_new:
             final_name = f"{name} — {datetime.now():%Y-%m-%d %H:%M:%S}" if auto_suffix else name
             fs = st.session_state.folder_support
             folder_field = fs.get("create_input_field") if fs else None
+
+            advanced = {
+                "not_rt": adv_not_rt, "not_quote": adv_not_quote, "not_reply": adv_not_reply,
+                "by_twitter": adv_by_twitter, "not_by_twitter": adv_not_by_twitter, "not_rt_of": adv_not_rt_of,
+                "not_site": adv_not_site, "langs": adv_langs, "location": adv_location, "media": adv_media,
+                "sample": adv_sample, "pinterest": adv_pinterest, "twitch": adv_twitch, "extra": adv_extra,
+            }
+            final_boolean = build_boolean_expression(boolean_expr, advanced)
+
             progress = st.status("Rodando busca...", expanded=True)
             try:
                 if folder_field:
                     progress.write(f'Criando busca ("{final_name}") na pasta {st.session_state.folder_id}...')
                 else:
                     progress.write(f"Criando busca (\"{final_name}\")...")
+                if final_boolean != boolean_expr.strip():
+                    progress.write("Aplicando configurações avançadas na booleana...")
                 search = create_search(
-                    final_name, networks, boolean_expr,
+                    final_name, networks, final_boolean,
                     folder_input_field=folder_field, folder_id=st.session_state.folder_id,
                 )
                 progress.write(f"✅ Busca criada — hash `{search['searchHash']}`")
@@ -752,6 +888,7 @@ with tab_new:
                     "id": search["id"],
                     "historic": historic_launched,
                     "realtime": realtime,
+                    "boolean": final_boolean,
                 }
             except Exception as e:
                 progress.update(label="Erro", state="error")
@@ -766,6 +903,9 @@ with tab_new:
         st.write(f"**Search ID:** {r['id']}")
         st.write(f"**Histórico lançado:** {'sim' if r['historic'] else 'não solicitado'}")
         st.write(f"**Tempo real:** {'iniciado' if r['realtime'] else 'não solicitado'}")
+        if r.get("boolean"):
+            with st.expander("Booleana final enviada (com configurações avançadas aplicadas)"):
+                st.code(r["boolean"], language=None)
         st.caption('Vá até a aba "📊 Resultados" para puxar o feed e montar o dashboard.')
 
 # ---- Minhas buscas ----
