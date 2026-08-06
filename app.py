@@ -1,5 +1,6 @@
 import io
 import re
+import time
 from collections import Counter
 from datetime import datetime
 from itertools import combinations
@@ -28,6 +29,7 @@ for key, default in {
     "results_df": None,
     "folder_id": "25",
     "folder_support": None,
+    "auto_track": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -134,18 +136,73 @@ def detect_categories():
 
 
 # ---------------- folder support (schema-driven, nothing hardcoded) ----------------
+def introspect_mutation_fields(endpoint):
+    query = """
+    query {
+      __schema {
+        mutationType {
+          fields {
+            name
+            args { name type { kind name ofType { kind name ofType { kind name } } } }
+          }
+        }
+      }
+    }"""
+    data = gql(endpoint, query)
+    mt = data["__schema"]["mutationType"]
+    return mt["fields"] if mt else []
+
+
+def detect_assign_mutation():
+    """Look for any mutation that takes an `input: XInput!` object containing both an
+    id-like field and a folder-like field — covers a dedicated moveToFolder as well as
+    a general updateSearch/editSearch mutation, whichever the schema actually has."""
+    mutation_fields = introspect_mutation_fields(TRAC_ENDPOINT)
+    for f in mutation_fields:
+        input_arg = next((a for a in f["args"] if a["name"] == "input"), None)
+        if not input_arg:
+            continue
+        named = unwrap_named_type(input_arg["type"])
+        if not named.get("name"):
+            continue
+        try:
+            infields = introspect_input_fields(named["name"])
+        except Exception:
+            continue
+        id_field = next((x["name"] for x in infields if x["name"].lower() in ("id", "searchid")), None)
+        folder_field = next((x["name"] for x in infields if "folder" in x["name"].lower()), None)
+        if id_field and folder_field:
+            return {"mutation": f["name"], "input_type": named["name"], "id_field": id_field, "folder_field": folder_field}
+    return None
+
+
+def assign_to_folder(assign_info, search_id, folder_id):
+    mutation = f"""
+    mutation AssignFolder($input: {assign_info['input_type']}!){{
+      {assign_info['mutation']}(input:$input){{ errors{{ id message extensions }} }}
+    }}"""
+    input_obj = {assign_info["id_field"]: search_id, assign_info["folder_field"]: folder_id}
+    data = trac_gql(mutation, {"input": input_obj})
+    result = data[assign_info["mutation"]]
+    errors = result.get("errors")
+    if errors:
+        raise RuntimeError(" | ".join(friendly_error(e["message"]) for e in errors))
+
+
 def detect_folder_support():
-    """Ask the TRAC metadata schema, in three different places, whether folders exist:
+    """Ask the TRAC metadata schema, in five different places, whether folders exist:
     1) an arg on the `searches` query (e.g. folderId)
     2) a standalone top-level query field (e.g. `folder`/`folders`)
     3) a field on the Search type itself, for client-side filtering
     4) an input field on CreateBooleanTopicsSearchInput, to assign new searches to a folder
+    5) a mutation (dedicated or general edit/update) that can move an existing search into a folder
     """
     info = {
         "searches_arg": None,
         "top_level_field": None,
         "search_type_folder_field": None,
         "create_input_field": None,
+        "assign_mutation": None,
         "raw_query_fields": [],
     }
     fields = introspect_query_fields(TRAC_ENDPOINT)
@@ -181,7 +238,34 @@ def detect_folder_support():
     if folder_input:
         info["create_input_field"] = folder_input["name"]
 
+    try:
+        info["assign_mutation"] = detect_assign_mutation()
+    except Exception:
+        info["assign_mutation"] = None
+
     return info
+
+
+def enrich_names(nodes):
+    """The dedicated folder field's node type may not expose 'name' at all. Cross-reference
+    with the documented `searches` query (which always has name) by hash, falling back to id."""
+    if not nodes or all(n.get("name") for n in nodes):
+        return nodes
+    try:
+        all_searches = list_searches()
+        by_hash = {s.get("searchHash"): s.get("name") for s in all_searches if s.get("searchHash")}
+        by_id = {str(s.get("id")): s.get("name") for s in all_searches if s.get("id") is not None}
+    except Exception:
+        return nodes
+    for n in nodes:
+        if not n.get("name"):
+            n["name"] = (
+                by_hash.get(n.get("searchHash"))
+                or by_id.get(str(n.get("id")))
+                or n.get("title")
+                or n.get("label")
+            )
+    return nodes
 
 
 def fetch_folder_searches(folder_field_name, folder_id):
@@ -211,7 +295,7 @@ def fetch_folder_searches(folder_field_name, folder_id):
     conn_type_fields = conn_type.get("fields") or []
     nodes_field = next((f for f in conn_type_fields if f["name"] in ("nodes", "edges", "items", "results")), None)
 
-    preferred = {"id", "name", "totalContents", "startDate", "status", "searchHash", "realtimeStatus"}
+    preferred = {"id", "name", "title", "label", "totalContents", "startDate", "status", "searchHash", "realtimeStatus"}
 
     if nodes_field:
         node_named = unwrap_named_type(nodes_field["type"])
@@ -234,7 +318,7 @@ def fetch_folder_searches(folder_field_name, folder_id):
         root = data[folder_field_name][conn_field["name"]][nodes_field["name"]]
         if nodes_field["name"] == "edges":
             root = [e["node"] for e in root]
-        return root
+        return enrich_names(root)
     else:
         leaf_names = [f["name"] for f in conn_type_fields if unwrap_named_type(f["type"]).get("kind") in LEAF_KINDS]
         selection_fields = [n for n in leaf_names if n in preferred] or leaf_names[:10]
@@ -249,7 +333,8 @@ def fetch_folder_searches(folder_field_name, folder_id):
         }}"""
         data = trac_gql(query, {"id": str(folder_id)})
         root = data[folder_field_name][conn_field["name"]]
-        return root if isinstance(root, list) else [root]
+        root = root if isinstance(root, list) else [root]
+        return enrich_names(root)
 
 
 # ---------------- TRAC metadata mutations ----------------
@@ -290,6 +375,75 @@ def get_historic_ids(search_id):
     }"""
     data = trac_gql(query, {"sid": search_id})
     return [n["id"] for n in data["historics"]["nodes"]]
+
+
+def get_historics_progress(search_id, historic_ids):
+    query = """
+    query PreviewHistorics($sid: ID){
+      historics(searchId:$sid){ nodes{ id status progress } }
+    }"""
+    data = trac_gql(query, {"sid": search_id})
+    nodes = [n for n in data["historics"]["nodes"] if n["id"] in historic_ids]
+    if not nodes:
+        return None, []
+    raw_values = [n.get("progress") for n in nodes if n.get("progress") is not None]
+    if not raw_values:
+        return None, [n.get("status") for n in nodes]
+    # normalize: API may return 0-1 fraction or 0-100 percentage
+    scaled = [v * 100 if v <= 1 else v for v in raw_values]
+    avg_progress = sum(scaled) / len(scaled)
+    return avg_progress, [n.get("status") for n in nodes]
+
+
+TERMINAL_OK = ("complete", "completed", "done", "finished", "ready", "success")
+TERMINAL_FAIL = ("fail", "error", "cancelled", "canceled")
+
+
+def poll_historic_progress(placeholder, search_id, historic_ids, max_wait=900, interval=6):
+    """Blocking poll loop: updates a progress bar + % + ETA in-place until the historic
+    finishes, fails, or max_wait is reached. ETA is estimated client-side from the observed
+    progress rate, since the API doesn't expose one directly."""
+    samples = []
+    started = time.time()
+    while True:
+        elapsed = time.time() - started
+        try:
+            progress, statuses = get_historics_progress(search_id, historic_ids)
+        except Exception as e:
+            placeholder.warning(f"Não consegui checar o progresso agora ({e}); tentando de novo...")
+            progress, statuses = None, []
+
+        statuses_low = [str(s).lower() for s in statuses if s]
+        done = bool(statuses_low) and all(any(k in s for k in TERMINAL_OK) for s in statuses_low)
+        failed = any(any(k in s for k in TERMINAL_FAIL) for s in statuses_low)
+
+        if progress is not None:
+            samples.append((elapsed, progress))
+            eta_txt = "calculando ETA..."
+            if len(samples) >= 2:
+                t0, p0 = samples[0]
+                rate = (progress - p0) / max(elapsed - t0, 1e-6)
+                if rate > 0.01 and progress < 100:
+                    eta_sec = (100 - progress) / rate
+                    mins = int(eta_sec // 60)
+                    eta_txt = f"ETA: ~{mins} min" if mins >= 1 else "ETA: menos de 1 min"
+                elif progress >= 100:
+                    eta_txt = "quase lá..."
+            with placeholder.container():
+                st.progress(min(int(progress), 100) / 100)
+                st.caption(f"{progress:.0f}% concluído · {eta_txt} · status: {', '.join(set(statuses)) or '—'}")
+        else:
+            with placeholder.container():
+                st.progress(0)
+                st.caption(f"Aguardando o Pulsar começar a processar... ({int(elapsed)}s)")
+
+        if done or progress is not None and progress >= 100:
+            return "done"
+        if failed:
+            return "failed"
+        if elapsed > max_wait:
+            return "timeout"
+        time.sleep(interval)
 
 
 def launch_historic(ids):
@@ -690,6 +844,134 @@ def extract_emojis(text):
     return EMOJI_PATTERN.findall(str(text))
 
 
+def render_dashboard(df, key_prefix=""):
+    st.dataframe(df, use_container_width=True)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="resultados")
+    st.download_button("⬇️ Baixar como Excel", buf.getvalue(), file_name="pulsar_resultados.xlsx", key=f"{key_prefix}dl")
+
+    st.divider()
+    st.subheader("Mapear colunas para os gráficos")
+    cols = list(df.columns)
+
+    def guess(keywords, default_idx=0):
+        for kw in keywords:
+            for c in cols:
+                if kw in c.lower():
+                    return c
+        return cols[default_idx] if cols else None
+
+    c1, c2, c3, c4 = st.columns(4)
+    text_col = c1.selectbox("Coluna de texto", cols, index=cols.index(guess(["text", "content", "body", "message"])) if guess(["text", "content", "body", "message"]) in cols else 0, key=f"{key_prefix}text_col")
+    date_col = c2.selectbox("Coluna de data", cols, index=cols.index(guess(["date", "created", "time", "publish"])) if guess(["date", "created", "time", "publish"]) in cols else 0, key=f"{key_prefix}date_col")
+    sentiment_col = c3.selectbox("Coluna de sentimento (opcional)", ["(nenhuma)"] + cols, key=f"{key_prefix}sentiment_col")
+    network_col = c4.selectbox("Coluna de rede (opcional)", ["(nenhuma)"] + cols, key=f"{key_prefix}network_col")
+
+    st.divider()
+    st.subheader("Dashboard")
+
+    g1, g2 = st.columns(2)
+
+    with g1:
+        st.markdown("**Volume por período**")
+        try:
+            dts = pd.to_datetime(df[date_col], errors="coerce")
+            vol = dts.dt.date.value_counts().sort_index()
+            fig = px.line(x=vol.index, y=vol.values, labels={"x": "Data", "y": "Menções"})
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Não consegui montar o gráfico de linha: {e}")
+
+    with g2:
+        if sentiment_col != "(nenhuma)":
+            st.markdown("**Sentimento**")
+            try:
+                vc = df[sentiment_col].astype(str).value_counts()
+                fig = px.pie(names=vc.index, values=vc.values)
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.warning(f"Não consegui montar o gráfico de sentimento: {e}")
+        else:
+            st.info("Selecione uma coluna de sentimento acima para ver este gráfico.")
+
+    all_tokens = []
+    all_emojis = []
+    for txt in df[text_col].dropna().astype(str):
+        all_tokens.extend(clean_tokens(txt))
+        all_emojis.extend(extract_emojis(txt))
+
+    g3, g4 = st.columns(2)
+    with g3:
+        st.markdown("**Nuvem de palavras**")
+        try:
+            from wordcloud import WordCloud
+            freq = Counter(all_tokens)
+            if freq:
+                wc = WordCloud(width=800, height=400, background_color="white").generate_from_frequencies(freq)
+                st.image(wc.to_image(), use_container_width=True)
+            else:
+                st.info("Sem termos suficientes para gerar a nuvem.")
+        except Exception as e:
+            st.warning(f"Não consegui gerar a nuvem de palavras: {e}")
+
+    with g4:
+        st.markdown("**Nuvem de emoji**")
+        freq_emoji = Counter(all_emojis)
+        if freq_emoji:
+            top = freq_emoji.most_common(30)
+            fig = px.treemap(
+                names=[e for e, _ in top],
+                parents=[""] * len(top),
+                values=[c for _, c in top],
+            )
+            fig.update_traces(textinfo="label+value", textfont_size=24)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Nenhum emoji encontrado no texto.")
+
+    st.markdown("**Teia de termos correlacionados**")
+    try:
+        import networkx as nx
+
+        top_terms = [t for t, _ in Counter(all_tokens).most_common(25)]
+        cooc = Counter()
+        for txt in df[text_col].dropna().astype(str):
+            present = set(clean_tokens(txt)) & set(top_terms)
+            for a, b in combinations(sorted(present), 2):
+                cooc[(a, b)] += 1
+
+        G = nx.Graph()
+        for term in top_terms:
+            G.add_node(term)
+        for (a, b), w in cooc.items():
+            if w > 0:
+                G.add_edge(a, b, weight=w)
+
+        if G.number_of_edges() > 0:
+            pos = nx.spring_layout(G, seed=42, k=0.6)
+            edge_x, edge_y = [], []
+            for a, b in G.edges():
+                edge_x += [pos[a][0], pos[b][0], None]
+                edge_y += [pos[a][1], pos[b][1], None]
+            edge_trace = go.Scatter(x=edge_x, y=edge_y, mode="lines", line=dict(width=1, color="#999"), hoverinfo="none")
+            freq_all = Counter(all_tokens)
+            node_x = [pos[n][0] for n in G.nodes()]
+            node_y = [pos[n][1] for n in G.nodes()]
+            node_size = [10 + freq_all[n] * 2 for n in G.nodes()]
+            node_trace = go.Scatter(
+                x=node_x, y=node_y, mode="markers+text", text=list(G.nodes()),
+                textposition="top center", marker=dict(size=node_size, color="#FFB74A"),
+            )
+            fig = go.Figure(data=[edge_trace, node_trace])
+            fig.update_layout(showlegend=False, xaxis=dict(visible=False), yaxis=dict(visible=False), height=550)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Termos não co-ocorreram o suficiente para montar a teia.")
+    except Exception as e:
+        st.warning(f"Não consegui montar a teia de termos: {e}")
+
+
 # ---------------- UI ----------------
 st.title("📡 Radar Simples — Pulsar")
 st.caption("Boolean + redes + período → busca criada, histórico lançado, e resultados com dashboard — tudo por aqui.")
@@ -756,7 +1038,8 @@ with tab_config:
     if fs:
         st.caption(
             f"searches(arg)={fs['searches_arg']} · campo próprio={fs['top_level_field']} · "
-            f"campo no objeto de busca={fs['search_type_folder_field']} · campo de criação={fs['create_input_field']}"
+            f"campo no objeto de busca={fs['search_type_folder_field']} · campo de criação={fs['create_input_field']} · "
+            f"mutação de mover={fs['assign_mutation']['mutation'] if fs.get('assign_mutation') else None}"
         )
 
 # ---- Nova busca ----
@@ -767,13 +1050,15 @@ with tab_new:
     fs_preview = st.session_state.folder_support
     if fs_preview and fs_preview.get("create_input_field"):
         st.caption(f"✅ Novas buscas serão criadas direto na pasta {st.session_state.folder_id}.")
+    elif fs_preview and fs_preview.get("assign_mutation"):
+        st.caption(f"✅ Novas buscas são movidas para a pasta {st.session_state.folder_id} logo após criadas (via `{fs_preview['assign_mutation']['mutation']}`).")
     elif fs_preview:
         st.caption(
-            "⚠️ O schema não expõe um campo para atribuir pasta na criação — a busca nasce sem pasta "
+            "⚠️ O schema não expõe nem criação nem mutação de mover pasta — a busca nasce fora da pasta "
             "e você precisará movê-la manualmente no Pulsar Platform."
         )
     else:
-        st.caption('Detecte o suporte a pastas na aba "⚙️ Configurações" para saber se dá pra criar já dentro da pasta 25.')
+        st.caption('Detecte o suporte a pastas na aba "⚙️ Configurações" para garantir que tudo caia na pasta 25.')
 
     name = st.text_input("Nome da busca", placeholder="ex: Cripto - Monitoramento Ago")
     auto_suffix = st.checkbox("Adicionar sufixo automático para evitar nomes duplicados", value=True)
@@ -836,6 +1121,7 @@ with tab_new:
             final_name = f"{name} — {datetime.now():%Y-%m-%d %H:%M:%S}" if auto_suffix else name
             fs = st.session_state.folder_support
             folder_field = fs.get("create_input_field") if fs else None
+            assign_info = fs.get("assign_mutation") if fs else None
 
             advanced = {
                 "not_rt": adv_not_rt, "not_quote": adv_not_quote, "not_reply": adv_not_reply,
@@ -846,6 +1132,8 @@ with tab_new:
             final_boolean = build_boolean_expression(boolean_expr, advanced)
 
             progress = st.status("Rodando busca...", expanded=True)
+            historic_ids = []
+            search = None
             try:
                 if folder_field:
                     progress.write(f'Criando busca ("{final_name}") na pasta {st.session_state.folder_id}...')
@@ -859,16 +1147,28 @@ with tab_new:
                 )
                 progress.write(f"✅ Busca criada — hash `{search['searchHash']}`")
 
+                folder_assigned = bool(folder_field)
+                if not folder_field and assign_info:
+                    progress.write(f"Movendo para a pasta {st.session_state.folder_id}...")
+                    try:
+                        assign_to_folder(assign_info, search["id"], st.session_state.folder_id)
+                        folder_assigned = True
+                        progress.write(f"✅ Movida para a pasta {st.session_state.folder_id}")
+                    except Exception as e:
+                        progress.write(f"⚠️ Não consegui mover para a pasta: {e}")
+                elif not folder_field and not assign_info:
+                    progress.write("⚠️ Schema não suporta atribuir pasta — busca ficou fora da pasta 25.")
+
                 historic_launched = False
                 if start and end:
                     progress.write("Configurando histórico...")
                     create_historic(search["id"], networks, iso_start(start), iso_end(end))
                     progress.write("Localizando ID do histórico...")
-                    ids = get_historic_ids(search["id"])
-                    if not ids:
+                    historic_ids = get_historic_ids(search["id"])
+                    if not historic_ids:
                         raise RuntimeError("nenhum histórico encontrado ainda — tente novamente em instantes.")
-                    progress.write(f"Lançando histórico ({len(ids)} encontrado(s))...")
-                    launch_historic(ids)
+                    progress.write(f"Lançando histórico ({len(historic_ids)} encontrado(s))...")
+                    launch_historic(historic_ids)
                     historic_launched = True
                     progress.write("✅ Histórico lançado")
 
@@ -889,10 +1189,13 @@ with tab_new:
                     "historic": historic_launched,
                     "realtime": realtime,
                     "boolean": final_boolean,
+                    "folder_assigned": folder_assigned,
                 }
+                st.session_state.auto_track = {"search": search, "historic_ids": historic_ids} if historic_launched else None
             except Exception as e:
                 progress.update(label="Erro", state="error")
                 st.error(str(e))
+                st.session_state.auto_track = None
 
     if st.session_state.last_result:
         r = st.session_state.last_result
@@ -901,12 +1204,45 @@ with tab_new:
         st.write(f"**Busca:** {r['name']}")
         st.code(r["hash"], language=None)
         st.write(f"**Search ID:** {r['id']}")
+        st.write(f"**Pasta {st.session_state.folder_id}:** {'✅ atribuída' if r.get('folder_assigned') else '⚠️ não atribuída — mova manualmente'}")
         st.write(f"**Histórico lançado:** {'sim' if r['historic'] else 'não solicitado'}")
         st.write(f"**Tempo real:** {'iniciado' if r['realtime'] else 'não solicitado'}")
         if r.get("boolean"):
             with st.expander("Booleana final enviada (com configurações avançadas aplicadas)"):
                 st.code(r["boolean"], language=None)
-        st.caption('Vá até a aba "📊 Resultados" para puxar o feed e montar o dashboard.')
+
+        track = st.session_state.get("auto_track")
+        if track:
+            st.divider()
+            st.subheader("Progresso do histórico")
+            placeholder = st.empty()
+            outcome = poll_historic_progress(placeholder, track["search"]["id"], track["historic_ids"])
+            st.session_state.auto_track = None  # only run the blocking poll once per creation
+
+            if outcome == "done":
+                st.success("Histórico concluído! Buscando os resultados automaticamente...")
+                try:
+                    with st.spinner("Descobrindo o melhor campo e buscando todos os campos..."):
+                        df, used_field, attempts = fetch_all_results_auto(track["search"])
+                    if df.empty:
+                        st.warning("O histórico terminou mas ainda não vieram registros — tente de novo em instantes na aba Resultados.")
+                    else:
+                        st.session_state.results_df = df
+                        st.session_state.results_field_used = used_field
+                        st.success(f"{len(df)} registro(s) carregado(s) via `{used_field}`.")
+                        st.divider()
+                        render_dashboard(df, key_prefix="auto_")
+                except Exception as e:
+                    st.error(f"Histórico pronto, mas não consegui puxar os resultados automaticamente: {e}")
+            elif outcome == "failed":
+                st.error("O histórico falhou no processamento do Pulsar. Confira na aba Minhas Buscas / no Pulsar Platform.")
+            else:
+                st.warning(
+                    "Ainda não terminou depois de um bom tempo esperando. Vá até a aba \"📊 Resultados\" mais tarde "
+                    "e puxe o estudo por lá quando estiver pronto."
+                )
+        elif r.get("historic"):
+            st.caption('Vá até a aba "📊 Resultados" para puxar o feed e montar o dashboard.')
 
 # ---- Minhas buscas ----
 with tab_list:
@@ -1012,131 +1348,7 @@ with tab_results:
         df = st.session_state.get("results_df")
         if df is not None and not df.empty:
             st.divider()
-            st.subheader("2. Planilha")
-            st.dataframe(df, use_container_width=True)
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False, sheet_name="resultados")
-            st.download_button("⬇️ Baixar como Excel", buf.getvalue(), file_name="pulsar_resultados.xlsx")
-
-            st.divider()
-            st.subheader("3. Mapear colunas para os gráficos")
-            cols = list(df.columns)
-
-            def guess(keywords, default_idx=0):
-                for kw in keywords:
-                    for c in cols:
-                        if kw in c.lower():
-                            return c
-                return cols[default_idx] if cols else None
-
-            c1, c2, c3, c4 = st.columns(4)
-            text_col = c1.selectbox("Coluna de texto", cols, index=cols.index(guess(["text", "content", "body", "message"])) if guess(["text", "content", "body", "message"]) in cols else 0)
-            date_col = c2.selectbox("Coluna de data", cols, index=cols.index(guess(["date", "created", "time", "publish"])) if guess(["date", "created", "time", "publish"]) in cols else 0)
-            sentiment_col = c3.selectbox("Coluna de sentimento (opcional)", ["(nenhuma)"] + cols)
-            network_col = c4.selectbox("Coluna de rede (opcional)", ["(nenhuma)"] + cols)
-
-            st.divider()
-            st.subheader("4. Dashboard")
-
-            g1, g2 = st.columns(2)
-
-            with g1:
-                st.markdown("**Volume por período**")
-                try:
-                    dts = pd.to_datetime(df[date_col], errors="coerce")
-                    vol = dts.dt.date.value_counts().sort_index()
-                    fig = px.line(x=vol.index, y=vol.values, labels={"x": "Data", "y": "Menções"})
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception as e:
-                    st.warning(f"Não consegui montar o gráfico de linha: {e}")
-
-            with g2:
-                if sentiment_col != "(nenhuma)":
-                    st.markdown("**Sentimento**")
-                    try:
-                        vc = df[sentiment_col].astype(str).value_counts()
-                        fig = px.pie(names=vc.index, values=vc.values)
-                        st.plotly_chart(fig, use_container_width=True)
-                    except Exception as e:
-                        st.warning(f"Não consegui montar o gráfico de sentimento: {e}")
-                else:
-                    st.info("Selecione uma coluna de sentimento acima para ver este gráfico.")
-
-            all_tokens = []
-            all_emojis = []
-            for txt in df[text_col].dropna().astype(str):
-                all_tokens.extend(clean_tokens(txt))
-                all_emojis.extend(extract_emojis(txt))
-
-            g3, g4 = st.columns(2)
-            with g3:
-                st.markdown("**Nuvem de palavras**")
-                try:
-                    from wordcloud import WordCloud
-                    freq = Counter(all_tokens)
-                    if freq:
-                        wc = WordCloud(width=800, height=400, background_color="white").generate_from_frequencies(freq)
-                        st.image(wc.to_image(), use_container_width=True)
-                    else:
-                        st.info("Sem termos suficientes para gerar a nuvem.")
-                except Exception as e:
-                    st.warning(f"Não consegui gerar a nuvem de palavras: {e}")
-
-            with g4:
-                st.markdown("**Nuvem de emoji**")
-                freq_emoji = Counter(all_emojis)
-                if freq_emoji:
-                    top = freq_emoji.most_common(30)
-                    fig = px.treemap(
-                        names=[e for e, _ in top],
-                        parents=[""] * len(top),
-                        values=[c for _, c in top],
-                    )
-                    fig.update_traces(textinfo="label+value", textfont_size=24)
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("Nenhum emoji encontrado no texto.")
-
-            st.markdown("**Teia de termos correlacionados**")
-            try:
-                import networkx as nx
-
-                top_terms = [t for t, _ in Counter(all_tokens).most_common(25)]
-                cooc = Counter()
-                for txt in df[text_col].dropna().astype(str):
-                    present = set(clean_tokens(txt)) & set(top_terms)
-                    for a, b in combinations(sorted(present), 2):
-                        cooc[(a, b)] += 1
-
-                G = nx.Graph()
-                for term in top_terms:
-                    G.add_node(term)
-                for (a, b), w in cooc.items():
-                    if w > 0:
-                        G.add_edge(a, b, weight=w)
-
-                if G.number_of_edges() > 0:
-                    pos = nx.spring_layout(G, seed=42, k=0.6)
-                    edge_x, edge_y = [], []
-                    for a, b in G.edges():
-                        edge_x += [pos[a][0], pos[b][0], None]
-                        edge_y += [pos[a][1], pos[b][1], None]
-                    edge_trace = go.Scatter(x=edge_x, y=edge_y, mode="lines", line=dict(width=1, color="#999"), hoverinfo="none")
-                    freq_all = Counter(all_tokens)
-                    node_x = [pos[n][0] for n in G.nodes()]
-                    node_y = [pos[n][1] for n in G.nodes()]
-                    node_size = [10 + freq_all[n] * 2 for n in G.nodes()]
-                    node_trace = go.Scatter(
-                        x=node_x, y=node_y, mode="markers+text", text=list(G.nodes()),
-                        textposition="top center", marker=dict(size=node_size, color="#FFB74A"),
-                    )
-                    fig = go.Figure(data=[edge_trace, node_trace])
-                    fig.update_layout(showlegend=False, xaxis=dict(visible=False), yaxis=dict(visible=False), height=550)
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("Termos não co-ocorreram o suficiente para montar a teia.")
-            except Exception as e:
-                st.warning(f"Não consegui montar a teia de termos: {e}")
+            st.subheader("2. Planilha e dashboard")
+            render_dashboard(df, key_prefix="res_")
         elif df is not None:
             st.info("A busca retornou 0 registros para esse período/rede.")
