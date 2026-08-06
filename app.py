@@ -426,18 +426,33 @@ def wait_for_preview_ready(placeholder, search_id, historic_ids, max_wait=180, i
         time.sleep(interval)
 
 
-def wait_for_results_ready(placeholder, search, max_wait=600, interval=20):
-    """Phase 3: instead of guessing the API's post-launch status vocabulary, directly probe
-    the Data Endpoint for actual fetchable results — a non-empty result IS the ground truth
-    that the historic finished, regardless of what the status field says."""
+def wait_for_results_ready(placeholder, search, historic_ids, max_wait=600, interval=20):
+    """Phase 3: show the real post-launch progress bar (the second loading you see on the
+    Pulsar Platform after hitting the rocket) as visual feedback, but don't trust its status
+    text alone to decide 'done' — that burned us once already with 'PREVIEWED'. The actual
+    stop condition is always: did a real fetch from the Data Endpoint come back non-empty."""
     started = time.time()
     attempt = 0
     last_attempts = []
     while True:
         elapsed = time.time() - started
         attempt += 1
+
+        try:
+            progress2, statuses2 = get_historics_progress(search["id"], historic_ids)
+        except Exception:
+            progress2, statuses2 = None, []
+
         with placeholder.container():
-            st.caption(f"Verificando se os dados já chegaram no Results... (tentativa {attempt}, {int(elapsed)}s decorridos)")
+            if progress2 is not None:
+                st.progress(min(int(progress2), 100) / 100)
+                st.caption(
+                    f"Coletando: {progress2:.0f}% · status: {', '.join(set(str(s) for s in statuses2)) or '—'} "
+                    f"· verificando o Results (tentativa {attempt}, {int(elapsed)}s decorridos)"
+                )
+            else:
+                st.caption(f"Verificando se os dados já chegaram no Results... (tentativa {attempt}, {int(elapsed)}s decorridos)")
+
         try:
             df, used_field, attempts = fetch_all_results_auto(search)
         except Exception:
@@ -1271,7 +1286,7 @@ with tab_new:
                 st.divider()
                 st.subheader("Aguardando os dados aparecerem no Results")
                 placeholder2 = st.empty()
-                df, used_field_or_attempts = wait_for_results_ready(placeholder2, search_obj)
+                df, used_field_or_attempts = wait_for_results_ready(placeholder2, search_obj, historic_ids)
 
                 if isinstance(used_field_or_attempts, str):
                     st.session_state.results_df = df
