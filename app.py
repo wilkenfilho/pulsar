@@ -395,55 +395,62 @@ def get_historics_progress(search_id, historic_ids):
     return avg_progress, [n.get("status") for n in nodes]
 
 
-TERMINAL_OK = ("complete", "completed", "done", "finished", "ready", "success")
 TERMINAL_FAIL = ("fail", "error", "cancelled", "canceled")
 
 
-def poll_historic_progress(placeholder, search_id, historic_ids, max_wait=900, interval=6):
-    """Blocking poll loop: updates a progress bar + % + ETA in-place until the historic
-    finishes, fails, or max_wait is reached. ETA is estimated client-side from the observed
-    progress rate, since the API doesn't expose one directly."""
-    samples = []
+def wait_for_preview_ready(placeholder, search_id, historic_ids, max_wait=180, interval=4):
+    """Phase 1: the historic must finish computing its preview (the '29K results' count you
+    see in the Pulsar UI before the rocket/launch button lights up) before launchHistoric
+    will actually take effect. Wait for progress to reach ~100 before trying to launch."""
     started = time.time()
     while True:
         elapsed = time.time() - started
         try:
             progress, statuses = get_historics_progress(search_id, historic_ids)
         except Exception as e:
-            placeholder.warning(f"Não consegui checar o progresso agora ({e}); tentando de novo...")
-            progress, statuses = None, []
+            progress, statuses = None, [str(e)]
 
         statuses_low = [str(s).lower() for s in statuses if s]
-        done = bool(statuses_low) and all(any(k in s for k in TERMINAL_OK) for s in statuses_low)
         failed = any(any(k in s for k in TERMINAL_FAIL) for s in statuses_low)
 
-        if progress is not None:
-            samples.append((elapsed, progress))
-            eta_txt = "calculando ETA..."
-            if len(samples) >= 2:
-                t0, p0 = samples[0]
-                rate = (progress - p0) / max(elapsed - t0, 1e-6)
-                if rate > 0.01 and progress < 100:
-                    eta_sec = (100 - progress) / rate
-                    mins = int(eta_sec // 60)
-                    eta_txt = f"ETA: ~{mins} min" if mins >= 1 else "ETA: menos de 1 min"
-                elif progress >= 100:
-                    eta_txt = "quase lá..."
-            with placeholder.container():
-                st.progress(min(int(progress), 100) / 100)
-                st.caption(f"{progress:.0f}% concluído · {eta_txt} · status: {', '.join(set(statuses)) or '—'}")
-        else:
-            with placeholder.container():
-                st.progress(0)
-                st.caption(f"Aguardando o Pulsar começar a processar... ({int(elapsed)}s)")
+        with placeholder.container():
+            st.progress(min(int(progress or 0), 100) / 100)
+            st.caption(f"Calculando preview: {progress:.0f}% · status: {', '.join(set(str(s) for s in statuses)) or '—'}" if progress is not None else f"Preparando preview... ({int(elapsed)}s)")
 
-        if done or progress is not None and progress >= 100:
-            return "done"
         if failed:
-            return "failed"
+            return "failed", statuses
+        if progress is not None and progress >= 99:
+            return "ready", statuses
         if elapsed > max_wait:
-            return "timeout"
+            return "timeout", statuses
         time.sleep(interval)
+
+
+def wait_for_results_ready(placeholder, search, max_wait=600, interval=20):
+    """Phase 3: instead of guessing the API's post-launch status vocabulary, directly probe
+    the Data Endpoint for actual fetchable results — a non-empty result IS the ground truth
+    that the historic finished, regardless of what the status field says."""
+    started = time.time()
+    attempt = 0
+    last_attempts = []
+    while True:
+        elapsed = time.time() - started
+        attempt += 1
+        with placeholder.container():
+            st.caption(f"Verificando se os dados já chegaram no Results... (tentativa {attempt}, {int(elapsed)}s decorridos)")
+        try:
+            df, used_field, attempts = fetch_all_results_auto(search)
+        except Exception:
+            df, used_field, attempts = pd.DataFrame(), None, []
+        last_attempts = attempts
+        if not df.empty:
+            return df, used_field
+        if elapsed > max_wait:
+            return pd.DataFrame(), last_attempts
+        time.sleep(interval)
+
+
+
 
 
 def launch_historic(ids):
@@ -789,26 +796,40 @@ def flatten_results(payload, field_name, nodes_key):
 
 
 def fetch_all_results_auto(search):
-    """Try the best-ranked candidate fields in order until one returns data successfully."""
+    """Try the best-ranked candidate fields in order until one returns data successfully.
+    Each attempt keeps the exact query/variables sent, so failures are fully inspectable
+    without needing to re-run anything."""
     fields = introspect_query_fields(DATA_ENDPOINT)
     ranked = rank_results_fields(DATA_ENDPOINT, fields)
     attempts = []
     for field_info in ranked[:8]:
         arg_name, gql_type, arg_value, nested_field = resolve_identifier(DATA_ENDPOINT, field_info, search)
         if not arg_name:
-            attempts.append((field_info["name"], "nenhum argumento (direto ou aninhado) parece aceitar o id/hash da busca — pulado"))
+            attempts.append({"field": field_info["name"], "message": "nenhum argumento (direto ou aninhado) parece aceitar o id/hash da busca — pulado", "query": None, "variables": None})
             continue
         arg_values = {arg_name: {"value": arg_value, "gql_type": gql_type}}
+        query, nodes_key = None, None
         try:
             query, nodes_key = build_dynamic_query(DATA_ENDPOINT, field_info["name"], arg_values)
-            payload = data_gql(query, {arg_name: arg_value})
+            variables = {arg_name: arg_value}
+            payload = data_gql(query, variables)
             df = flatten_results(payload, field_info["name"], nodes_key)
             if not df.empty:
                 return df, field_info["name"], attempts
-            attempts.append((field_info["name"], "retornou 0 registros"))
+            attempts.append({"field": field_info["name"], "message": "retornou 0 registros", "query": query, "variables": variables})
         except Exception as e:
-            attempts.append((field_info["name"], str(e)))
+            attempts.append({"field": field_info["name"], "message": str(e), "query": query, "variables": {arg_name: arg_value}})
     return pd.DataFrame(), None, attempts
+
+
+def render_fetch_attempts(attempts):
+    for a in attempts:
+        with st.expander(f"**{a['field']}** — {a['message']}"):
+            if a.get("query"):
+                st.code(a["query"], language="graphql")
+            if a.get("variables") is not None:
+                st.json(a["variables"])
+    st.caption("Copie isso (não o token) e me manda que eu ajusto a lógica de escolha de campo/argumento com precisão.")
 
 
 # ---------------- text mining helpers (for word cloud / emoji / correlation) ----------------
@@ -1159,18 +1180,20 @@ with tab_new:
                 elif not folder_field and not assign_info:
                     progress.write("⚠️ Schema não suporta atribuir pasta — busca ficou fora da pasta 25.")
 
-                historic_launched = False
+                historic_configured = False
+                historic_ids = []
                 if start and end:
-                    progress.write("Configurando histórico...")
+                    progress.write("Configurando histórico (preview)...")
                     create_historic(search["id"], networks, iso_start(start), iso_end(end))
                     progress.write("Localizando ID do histórico...")
                     historic_ids = get_historic_ids(search["id"])
                     if not historic_ids:
                         raise RuntimeError("nenhum histórico encontrado ainda — tente novamente em instantes.")
-                    progress.write(f"Lançando histórico ({len(historic_ids)} encontrado(s))...")
-                    launch_historic(historic_ids)
-                    historic_launched = True
-                    progress.write("✅ Histórico lançado")
+                    historic_configured = True
+                    progress.write(
+                        f"✅ Histórico configurado ({len(historic_ids)} encontrado(s)) — o lançamento (o 'foguete') "
+                        "acontece automaticamente assim que o preview terminar de calcular, no painel abaixo."
+                    )
 
                 if realtime:
                     progress.write("Iniciando coleta em tempo real...")
@@ -1186,12 +1209,12 @@ with tab_new:
                     "name": search["name"],
                     "hash": search["searchHash"],
                     "id": search["id"],
-                    "historic": historic_launched,
+                    "historic": historic_configured,
                     "realtime": realtime,
                     "boolean": final_boolean,
                     "folder_assigned": folder_assigned,
                 }
-                st.session_state.auto_track = {"search": search, "historic_ids": historic_ids} if historic_launched else None
+                st.session_state.auto_track = {"search": search, "historic_ids": historic_ids} if historic_configured else None
             except Exception as e:
                 progress.update(label="Erro", state="error")
                 st.error(str(e))
@@ -1205,7 +1228,16 @@ with tab_new:
         st.code(r["hash"], language=None)
         st.write(f"**Search ID:** {r['id']}")
         st.write(f"**Pasta {st.session_state.folder_id}:** {'✅ atribuída' if r.get('folder_assigned') else '⚠️ não atribuída — mova manualmente'}")
-        st.write(f"**Histórico lançado:** {'sim' if r['historic'] else 'não solicitado'}")
+        if not r.get("folder_assigned"):
+            fs_now = st.session_state.folder_support
+            if not fs_now:
+                st.caption(
+                    'Isso costuma ser porque a detecção de pastas ainda não rodou. Vá em '
+                    '"⚙️ Configurações" → "Detectar suporte a pastas no schema" antes da próxima busca.'
+                )
+            else:
+                st.caption("O schema não expôs nem criação nem edição com campo de pasta — confirmado via introspection, não é falta de tentativa.")
+        st.write(f"**Histórico:** {'configurado — acompanhe o lançamento automático abaixo' if r['historic'] else 'não solicitado'}")
         st.write(f"**Tempo real:** {'iniciado' if r['realtime'] else 'não solicitado'}")
         if r.get("boolean"):
             with st.expander("Booleana final enviada (com configurações avançadas aplicadas)"):
@@ -1215,32 +1247,47 @@ with tab_new:
         if track:
             st.divider()
             st.subheader("Progresso do histórico")
-            placeholder = st.empty()
-            outcome = poll_historic_progress(placeholder, track["search"]["id"], track["historic_ids"])
-            st.session_state.auto_track = None  # only run the blocking poll once per creation
+            search_obj = track["search"]
+            historic_ids = track["historic_ids"]
+            st.session_state.auto_track = None  # only run this blocking flow once per creation
 
-            if outcome == "done":
-                st.success("Histórico concluído! Buscando os resultados automaticamente...")
-                try:
-                    with st.spinner("Descobrindo o melhor campo e buscando todos os campos..."):
-                        df, used_field, attempts = fetch_all_results_auto(track["search"])
-                    if df.empty:
-                        st.warning("O histórico terminou mas ainda não vieram registros — tente de novo em instantes na aba Resultados.")
-                    else:
-                        st.session_state.results_df = df
-                        st.session_state.results_field_used = used_field
-                        st.success(f"{len(df)} registro(s) carregado(s) via `{used_field}`.")
-                        st.divider()
-                        render_dashboard(df, key_prefix="auto_")
-                except Exception as e:
-                    st.error(f"Histórico pronto, mas não consegui puxar os resultados automaticamente: {e}")
-            elif outcome == "failed":
-                st.error("O histórico falhou no processamento do Pulsar. Confira na aba Minhas Buscas / no Pulsar Platform.")
+            placeholder = st.empty()
+            preview_outcome, preview_statuses = wait_for_preview_ready(placeholder, search_obj["id"], historic_ids)
+
+            if preview_outcome == "failed":
+                st.error(f"O preview falhou no Pulsar (status: {', '.join(set(str(s) for s in preview_statuses))}). Confira no Pulsar Platform.")
             else:
-                st.warning(
-                    "Ainda não terminou depois de um bom tempo esperando. Vá até a aba \"📊 Resultados\" mais tarde "
-                    "e puxe o estudo por lá quando estiver pronto."
-                )
+                if preview_outcome == "timeout":
+                    st.warning("Preview demorou mais que o esperado — tentando lançar mesmo assim.")
+
+                with placeholder.container():
+                    st.caption("🚀 Preview pronto — lançando o histórico agora...")
+                try:
+                    launch_historic(historic_ids)
+                    st.success("✅ Histórico lançado (equivalente a apertar o foguete no Pulsar Platform).")
+                except Exception as e:
+                    st.error(f"O preview terminou mas o lançamento falhou: {e}")
+
+                st.divider()
+                st.subheader("Aguardando os dados aparecerem no Results")
+                placeholder2 = st.empty()
+                df, used_field_or_attempts = wait_for_results_ready(placeholder2, search_obj)
+
+                if isinstance(used_field_or_attempts, str):
+                    st.session_state.results_df = df
+                    st.session_state.results_field_used = used_field_or_attempts
+                    st.success(f"{len(df)} registro(s) carregado(s) via `{used_field_or_attempts}`.")
+                    st.divider()
+                    render_dashboard(df, key_prefix="auto_")
+                else:
+                    st.warning(
+                        "Ainda não consegui trazer resultados depois de esperar. Isso é normal para períodos "
+                        "grandes — ou pode indicar algo no schema que vale eu ajustar."
+                    )
+                    if used_field_or_attempts:
+                        render_fetch_attempts(used_field_or_attempts)
+                    if st.button("🔄 Tentar de novo agora", key="retry_after_wait"):
+                        st.rerun()
         elif r.get("historic"):
             st.caption('Vá até a aba "📊 Resultados" para puxar o feed e montar o dashboard.')
 
@@ -1315,6 +1362,9 @@ with tab_results:
             except Exception as e:
                 st.error(str(e))
 
+        # belt-and-suspenders: whatever the source, patch any missing names before showing the picker
+        st.session_state.searches = enrich_names(st.session_state.searches)
+
         def _label(s):
             nm = s.get("name") or f"(sem nome) {s.get('searchHash', s.get('id', '?'))}"
             return f"{nm} — {s.get('searchHash', '')}"
@@ -1333,10 +1383,7 @@ with tab_results:
                     df, used_field, attempts = fetch_all_results_auto(picked)
                 if df.empty:
                     st.error("Não consegui trazer resultados automaticamente.")
-                    with st.expander("O que foi tentado"):
-                        for fname, msg in attempts:
-                            st.write(f"**{fname}**: {msg}")
-                    st.caption("Me manda essa lista que eu ajusto a lógica de escolha de campo.")
+                    render_fetch_attempts(attempts)
                 else:
                     st.session_state.results_df = df
                     st.session_state.results_field_used = used_field
