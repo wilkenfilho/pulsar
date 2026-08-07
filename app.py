@@ -408,7 +408,7 @@ def get_historics_progress(search_id, historic_ids):
 TERMINAL_FAIL = ("fail", "error", "cancelled", "canceled")
 
 
-def run_full_historic_flow(placeholder, search, historic_ids, max_wait_preview=300, max_wait_collect=7200, interval=8, fetch_check_every=20):
+def run_full_historic_flow(placeholder, search, historic_ids, max_wait_preview=300, max_wait_collect=7200, interval=8):
     """One continuous, automatic wait — no clicks, no reruns:
     1) waits for the preview to finish computing (the '29K results' count in the Pulsar UI),
     2) launches the historic itself the moment it's ready (the 'rocket'),
@@ -453,15 +453,14 @@ def run_full_historic_flow(placeholder, search, historic_ids, max_wait_preview=3
     except Exception as e:
         return "launch_failed", str(e), None
 
-    # Phase 2 — collecting, with ETA, checking the Data Endpoint periodically without stopping the loop
+    # Phase 2 — wait for COMPLETED, then fetch all results at once (no partial sampling)
     started2 = time.time()
     samples = []
-    last_fetch_check = -fetch_check_every
     last_attempts = []
     last_status_text = "—"
     debug_placeholder = st.empty()
-    looks_done_streak = 0
-    LOOKS_DONE_HINTS = ("complet", "done", "finish", "ready", "success")
+    COMPLETED_HINTS = ("complet", "done", "finish", "success")
+    collection_done = False
 
     while True:
         elapsed2 = time.time() - started2
@@ -471,6 +470,10 @@ def run_full_historic_flow(placeholder, search, historic_ids, max_wait_preview=3
             progress2, statuses2 = None, []
         if statuses2:
             last_status_text = ", ".join(set(str(s) for s in statuses2))
+
+        # Check if ALL historics have a completed-looking status
+        statuses_low = [str(s).lower() for s in statuses2 if s]
+        all_completed = bool(statuses_low) and all(any(h in s for h in COMPLETED_HINTS) for s in statuses_low)
 
         eta_txt = ""
         if progress2 is not None:
@@ -486,14 +489,20 @@ def run_full_historic_flow(placeholder, search, historic_ids, max_wait_preview=3
         with placeholder.container():
             if progress2 is not None:
                 st.progress(min(int(progress2), 100) / 100)
-                st.caption(f"Coletando: {progress2:.0f}%{eta_txt} · status: {last_status_text} · {int(elapsed2)}s decorridos")
+                if all_completed:
+                    st.caption(f"✅ Coleta finalizada · status: {last_status_text} · {int(elapsed2)}s decorridos — buscando resultados completos...")
+                else:
+                    st.caption(f"Coletando: {progress2:.0f}%{eta_txt} · status: {last_status_text} · {int(elapsed2)}s decorridos")
             else:
                 st.caption(f"Aguardando a coleta começar... ({int(elapsed2)}s decorridos)")
 
-        # the real Data Endpoint probe is heavier (several GraphQL calls) — only do it every N seconds,
-        # while the lightweight progress/ETA display above keeps updating every `interval`
-        if elapsed2 - last_fetch_check >= fetch_check_every:
-            last_fetch_check = elapsed2
+        # Only fetch results AFTER the collection is truly done — no partial sampling
+        if all_completed and not collection_done:
+            collection_done = True
+            # Give a small buffer for the Data Endpoint to sync
+            time.sleep(5)
+
+        if collection_done:
             try:
                 df, used_field, attempts = fetch_all_results_auto(search)
             except Exception:
@@ -503,20 +512,13 @@ def run_full_historic_flow(placeholder, search, historic_ids, max_wait_preview=3
                 debug_placeholder.empty()
                 return "done", df, used_field
 
-            # Pulsar says it's done (COMPLETED/READY/etc.) but the Data Endpoint still won't
-            # give us anything — surface that live instead of silently retrying for up to 2h.
-            status_looks_done = any(h in last_status_text.lower() for h in LOOKS_DONE_HINTS)
-            looks_done_streak = looks_done_streak + 1 if status_looks_done else 0
-            if looks_done_streak >= 2:
-                with debug_placeholder.container():
-                    st.warning(
-                        f'O Pulsar reporta status "{last_status_text}" (parece concluído), mas o Data Endpoint '
-                        "ainda não devolveu registros para nenhum campo testado. Continuando a tentar automaticamente "
-                        "— pode ser só um atraso de sincronização entre os dois serviços."
-                    )
-                    render_fetch_attempts(attempts)
-            else:
-                debug_placeholder.empty()
+            with debug_placeholder.container():
+                st.warning(
+                    f'O Pulsar reporta status "{last_status_text}" (concluído), mas o Data Endpoint '
+                    "ainda não devolveu registros. Tentando novamente em instantes..."
+                )
+                render_fetch_attempts(attempts)
+            time.sleep(15)  # wait a bit longer between retries after completion
 
         if elapsed2 > max_wait_collect:
             return "long_wait", last_attempts, last_status_text
