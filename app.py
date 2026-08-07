@@ -12,7 +12,7 @@ import requests
 import streamlit as st
 
 TRAC_ENDPOINT = "https://trac.pulsarplatform.com/graphql"
-DATA_ENDPOINT = "https://data.pulsarplatform.com/graphql/trac"
+DATA_ENDPOINT_BASE = "https://data.pulsarplatform.com/graphql/trac"
 DEFAULT_CATEGORIES = ["REDDIT", "FORUMS", "FACEBOOK"]
 
 st.set_page_config(page_title="Radar Simples — Pulsar", page_icon="📡", layout="wide")
@@ -67,8 +67,9 @@ def trac_gql(query, variables=None):
     return gql(TRAC_ENDPOINT, query, variables)
 
 
-def data_gql(query, variables=None):
-    return gql(DATA_ENDPOINT, query, variables)
+def data_gql(query, variables=None, search_hash=None):
+    endpoint = f"{DATA_ENDPOINT_BASE}/{search_hash}" if search_hash else DATA_ENDPOINT_BASE
+    return gql(endpoint, query, variables)
 
 
 def friendly_error(msg: str) -> str:
@@ -949,75 +950,74 @@ def build_filter_candidates(search, filter_fields):
 
 
 def fetch_all_results_auto(search):
-    """Introspect FilterInput, generate all plausible filter values, try them against the
-    best-ranked query fields until one returns data. Shows full debug for every attempt."""
-    fields = introspect_query_fields(DATA_ENDPOINT)
-    ranked = rank_results_fields(DATA_ENDPOINT, fields)
+    """The Data Endpoint is scoped by search hash IN THE URL:
+    https://data.pulsarplatform.com/graphql/trac/{searchHash}
+    FilterInput is only for post-fetch filtering (date range, sentiment, etc.), not for
+    identifying the search. This was the root cause of every 'Searches not found' error."""
+    search_hash = search.get("searchHash") or search.get("hash")
+    if not search_hash:
+        return pd.DataFrame(), None, [{"field": "(erro)", "message": "objeto de busca sem searchHash", "query": None, "variables": search}]
+
+    endpoint = f"{DATA_ENDPOINT_BASE}/{search_hash}"
     attempts = []
 
-    # Step 1: discover FilterInput fields
-    filter_fields = introspect_filter_input(DATA_ENDPOINT)
-    filter_candidates = build_filter_candidates(search, filter_fields)
-
-    if not filter_candidates:
-        attempts.append({
-            "field": "(diagnóstico)",
-            "message": f"FilterInput tem estes campos: {filter_fields} — nenhum parece aceitar hash/id da busca",
-            "query": None, "variables": {"search_object": search, "filter_fields": filter_fields},
-        })
+    try:
+        fields = introspect_query_fields(endpoint)
+    except Exception as e:
+        attempts.append({"field": "(introspection)", "message": f"falha ao introspectar {endpoint}: {e}", "query": None, "variables": None})
         return pd.DataFrame(), None, attempts
 
-    # Step 2: for each candidate query field, try each filter combination
-    best_field = ranked[0] if ranked else None
-    if not best_field:
-        attempts.append({"field": "(diagnóstico)", "message": "nenhum campo candidato encontrado no schema", "query": None, "variables": None})
+    ranked = rank_results_fields(endpoint, fields)
+    if not ranked:
+        attempts.append({"field": "(diagnóstico)", "message": f"nenhum campo candidato encontrado. Campos disponíveis: {[f['name'] for f in fields]}", "query": None, "variables": None})
         return pd.DataFrame(), None, attempts
 
-    # Find the filter arg
-    filter_arg = None
-    filter_gql_type = "FilterInput!"
-    for a in best_field["args"]:
-        named = unwrap_named_type(a["type"])
-        if named.get("kind") == "INPUT_OBJECT":
-            filter_arg = a["name"]
-            filter_gql_type = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
-            break
-    if not filter_arg:
-        filter_arg = best_field["args"][0]["name"] if best_field["args"] else "filter"
+    for field_info in ranked[:5]:
+        # Find if this field has a FilterInput arg (optional — pass empty or skip)
+        filter_arg = None
+        filter_type = None
+        for a in field_info["args"]:
+            named = unwrap_named_type(a["type"])
+            if named.get("kind") == "INPUT_OBJECT":
+                filter_arg = a["name"]
+                filter_type = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
+                break
 
-    for filter_value in filter_candidates:
-        for field_info in ranked[:3]:  # try top 3 fields for each filter combo
-            # check this field also uses a FilterInput-like arg
-            fi_arg = None
-            fi_type = filter_gql_type
-            for a in field_info["args"]:
-                named = unwrap_named_type(a["type"])
-                if named.get("kind") == "INPUT_OBJECT":
-                    fi_arg = a["name"]
-                    fi_type = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
-                    break
-            if not fi_arg:
-                continue
+        # Build query — with or without the filter arg
+        if filter_arg and filter_type:
+            arg_values = {filter_arg: {"value": {}, "gql_type": filter_type}}
+        else:
+            arg_values = {}
 
-            arg_values = {fi_arg: {"value": filter_value, "gql_type": fi_type}}
-            query, nodes_key = None, None
-            try:
-                query, nodes_key = build_dynamic_query(DATA_ENDPOINT, field_info["name"], arg_values)
-                variables = {fi_arg: filter_value}
-                payload = data_gql(query, variables)
-                df = flatten_results(payload, field_info["name"], nodes_key)
-                if not df.empty:
-                    return df, field_info["name"], attempts
-                attempts.append({"field": field_info["name"], "message": "retornou 0 registros", "query": query, "variables": variables})
-            except Exception as e:
-                attempts.append({"field": field_info["name"], "message": str(e), "query": query, "variables": {fi_arg: filter_value}})
+        query, nodes_key = None, None
+        try:
+            query, nodes_key = build_dynamic_query(endpoint, field_info["name"], arg_values)
+            variables = {k: v["value"] for k, v in arg_values.items()} if arg_values else {}
+            payload = data_gql(query, variables, search_hash=search_hash)
+            df = flatten_results(payload, field_info["name"], nodes_key)
+            if not df.empty:
+                return df, field_info["name"], attempts
+            attempts.append({"field": field_info["name"], "message": "retornou 0 registros", "query": query, "variables": variables})
+        except Exception as e:
+            err_msg = str(e)
+            # If FilterInput is required but we sent empty, try without the arg entirely
+            if filter_arg and "required" in err_msg.lower():
+                try:
+                    arg_values2 = {}
+                    query2, nodes_key2 = build_dynamic_query(endpoint, field_info["name"], arg_values2)
+                    payload2 = data_gql(query2, {}, search_hash=search_hash)
+                    df2 = flatten_results(payload2, field_info["name"], nodes_key2)
+                    if not df2.empty:
+                        return df2, field_info["name"], attempts
+                except Exception as e2:
+                    err_msg = f"{err_msg} | sem filtro: {e2}"
+            attempts.append({"field": field_info["name"], "message": err_msg, "query": query, "variables": {k: v["value"] for k, v in arg_values.items()} if arg_values else {}})
 
-    # Add diagnostic info at the end
     attempts.append({
-        "field": "(diagnóstico — FilterInput)",
-        "message": f"Campos disponíveis em FilterInput: {filter_fields}",
+        "field": "(diagnóstico)",
+        "message": f"Endpoint usado: {endpoint}",
         "query": None,
-        "variables": {"search_hash": search.get("searchHash"), "search_id": search.get("id"), "filter_combos_tried": len(filter_candidates)},
+        "variables": {"search_hash": search_hash, "fields_tried": [f["name"] for f in ranked[:5]]},
     })
     return pd.DataFrame(), None, attempts
 
