@@ -984,30 +984,52 @@ def fetch_all_results_auto(search, date_from=None, date_to=None):
 
     for filter_value in filter_variations:
         for field_info in ranked[:3]:
-            # Find the FilterInput arg
+            # Find the FilterInput arg and any pagination args
             filter_arg = None
             filter_type = None
+            page_arg = None
+            limit_arg = None
             for a in field_info["args"]:
                 named = unwrap_named_type(a["type"])
                 if named.get("kind") == "INPUT_OBJECT":
                     filter_arg = a["name"]
                     filter_type = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
-                    break
+                low = a["name"].lower()
+                if low in ("limit", "first", "pagesize", "size", "perpage"):
+                    limit_arg = a["name"]
+                elif low in ("page", "offset", "skip", "after"):
+                    page_arg = a["name"]
             if not filter_arg:
                 continue
 
+            # Build query with high limit to get as many results as possible
             arg_values = {filter_arg: {"value": filter_value, "gql_type": filter_type}}
+            if limit_arg:
+                arg_values[limit_arg] = {"value": 10000, "gql_type": "Int"}
+
             query, nodes_key = None, None
             try:
                 query, nodes_key = build_dynamic_query(DATA_ENDPOINT, field_info["name"], arg_values)
-                variables = {filter_arg: filter_value}
+                variables = {k: v["value"] for k, v in arg_values.items()}
                 payload = data_gql(query, variables)
                 df = flatten_results(payload, field_info["name"], nodes_key)
                 if not df.empty:
                     return df, field_info["name"], attempts
                 attempts.append({"field": field_info["name"], "message": "retornou 0 registros", "query": query, "variables": variables})
             except Exception as e:
-                attempts.append({"field": field_info["name"], "message": str(e), "query": query, "variables": {filter_arg: filter_value}})
+                # If limit too high caused an error, retry without it
+                if limit_arg and "limit" in str(e).lower():
+                    try:
+                        arg_values2 = {filter_arg: {"value": filter_value, "gql_type": filter_type}}
+                        query2, nodes_key2 = build_dynamic_query(DATA_ENDPOINT, field_info["name"], arg_values2)
+                        variables2 = {filter_arg: filter_value}
+                        payload2 = data_gql(query2, variables2)
+                        df2 = flatten_results(payload2, field_info["name"], nodes_key2)
+                        if not df2.empty:
+                            return df2, field_info["name"], attempts
+                    except Exception:
+                        pass
+                attempts.append({"field": field_info["name"], "message": str(e), "query": query, "variables": {k: v["value"] for k, v in arg_values.items()}})
 
     attempts.append({
         "field": "(diagnóstico)",
@@ -1498,23 +1520,9 @@ with tab_list:
     if not st.session_state.token:
         st.warning("Cole seu token na aba Configurações antes de continuar.")
     else:
-        fs = st.session_state.folder_support
-        restrict = st.checkbox(f"Mostrar só a pasta {st.session_state.folder_id}", value=True)
-
         if st.button("🔄 Atualizar lista"):
             try:
-                if restrict and fs and fs.get("top_level_field"):
-                    with st.spinner(f"Buscando pasta {st.session_state.folder_id} via {fs['top_level_field']}..."):
-                        st.session_state.searches = fetch_folder_searches(fs["top_level_field"], st.session_state.folder_id)
-                elif restrict and fs and (fs.get("searches_arg") or fs.get("search_type_folder_field")):
-                    st.session_state.searches = list_searches(folder_support=fs, folder_id=st.session_state.folder_id)
-                else:
-                    if restrict:
-                        st.info(
-                            'Ainda não detectei suporte a pastas — mostrando todas as buscas. '
-                            'Rode "Detectar suporte a pastas" na aba Configurações.'
-                        )
-                    st.session_state.searches = list_searches()
+                st.session_state.searches = list_searches()
             except Exception as e:
                 st.error(str(e))
 
@@ -1526,7 +1534,7 @@ with tab_list:
                 col.markdown(f"**{label}**")
             for s in st.session_state.searches:
                 cols = st.columns([3, 2, 2, 2, 2])
-                cols[0].write(s["name"])
+                cols[0].write(s.get("name") or s.get("searchHash", "?"))
                 cols[1].write(s.get("status") or "-")
                 is_on = s.get("realtimeStatus") == "STARTED"
                 cols[2].write(("🟢 " if is_on else "⚪ ") + str(s.get("realtimeStatus") or "-"))
@@ -1536,12 +1544,7 @@ with tab_list:
                         try:
                             stop_search(s["id"])
                             st.success("Parado.")
-                            if restrict and fs and fs.get("top_level_field"):
-                                st.session_state.searches = fetch_folder_searches(fs["top_level_field"], st.session_state.folder_id)
-                            elif restrict and fs and (fs.get("searches_arg") or fs.get("search_type_folder_field")):
-                                st.session_state.searches = list_searches(folder_support=fs, folder_id=st.session_state.folder_id)
-                            else:
-                                st.session_state.searches = list_searches()
+                            st.session_state.searches = list_searches()
                             st.rerun()
                         except Exception as e:
                             st.error(str(e))
@@ -1553,19 +1556,10 @@ with tab_results:
     else:
         st.subheader("1. Escolha o estudo")
         if not st.session_state.searches:
-            fs = st.session_state.folder_support
             try:
-                if fs and (fs.get("searches_arg") or fs.get("search_type_folder_field")):
-                    st.session_state.searches = list_searches(folder_support=fs, folder_id=st.session_state.folder_id)
-                elif fs and fs.get("top_level_field"):
-                    st.session_state.searches = fetch_folder_searches(fs["top_level_field"], st.session_state.folder_id)
-                else:
-                    st.session_state.searches = list_searches()
+                st.session_state.searches = list_searches()
             except Exception as e:
                 st.error(str(e))
-
-        # belt-and-suspenders: whatever the source, patch any missing names before showing the picker
-        st.session_state.searches = enrich_names(st.session_state.searches)
 
         def _label(s):
             nm = s.get("name") or f"(sem nome) {s.get('searchHash', s.get('id', '?'))}"
