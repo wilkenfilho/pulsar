@@ -991,10 +991,18 @@ def fetch_all_results_auto(search, date_from=None, date_to=None):
             limit_arg = None
             for a in field_info["args"]:
                 named = unwrap_named_type(a["type"])
-                if named.get("kind") == "INPUT_OBJECT":
-                    filter_arg = a["name"]
-                    filter_type = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
                 low = a["name"].lower()
+                # Prefer the arg named "filter" or whose type contains "Filter";
+                # skip "options"/"ResultsOptionsInput" which is for pagination/sorting
+                if named.get("kind") == "INPUT_OBJECT":
+                    type_name = (named.get("name") or "").lower()
+                    if low == "filter" or "filter" in type_name:
+                        filter_arg = a["name"]
+                        filter_type = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
+                    elif not filter_arg:
+                        # fallback: use this INPUT_OBJECT only if nothing better found yet
+                        filter_arg = a["name"]
+                        filter_type = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
                 if low in ("limit", "first", "pagesize", "size", "perpage"):
                     limit_arg = a["name"]
                 elif low in ("page", "offset", "skip", "after"):
