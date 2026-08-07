@@ -948,14 +948,19 @@ def build_filter_candidates(search, filter_fields):
     return unique
 
 
-def fetch_all_results_auto(search):
-    """The Data Endpoint identifies the search via `searchIds` inside FilterInput.
-    The field is typed as String and the value is the search HASH (not numeric ID).
-    We try hash first, then numeric ID as fallback, then both together."""
+def fetch_all_results_auto(search, date_from=None, date_to=None):
+    """The Data Endpoint identifies the search via `searchIds` (array) inside FilterInput.
+    `dateFrom` and `dateTo` are also REQUIRED by FilterInput."""
     search_hash = search.get("searchHash") or search.get("hash")
     search_id = search.get("id")
     if not search_hash and not search_id:
         return pd.DataFrame(), None, [{"field": "(erro)", "message": "objeto de busca sem searchHash nem id", "query": None, "variables": search}]
+
+    # If no dates passed explicitly, use a wide default range
+    if not date_from:
+        date_from = (datetime.now() - pd.Timedelta(days=90)).strftime("%Y-%m-%dT00:00:00Z")
+    if not date_to:
+        date_to = datetime.now().strftime("%Y-%m-%dT23:59:59Z")
 
     attempts = []
 
@@ -970,12 +975,12 @@ def fetch_all_results_auto(search):
         attempts.append({"field": "(diagnóstico)", "message": f"nenhum campo candidato. Campos: {[f['name'] for f in fields]}", "query": None, "variables": None})
         return pd.DataFrame(), None, attempts
 
-    # Build filter variations to try — searchIds with hash, with id, with both
+    # Build filter — searchIds as array + required date range
     filter_variations = []
     if search_hash:
-        filter_variations.append({"searchIds": [search_hash]})
+        filter_variations.append({"searchIds": [search_hash], "dateFrom": date_from, "dateTo": date_to})
     if search_id:
-        filter_variations.append({"searchIds": [str(search_id)]})
+        filter_variations.append({"searchIds": [str(search_id)], "dateFrom": date_from, "dateTo": date_to})
 
     for filter_value in filter_variations:
         for field_info in ranked[:3]:
