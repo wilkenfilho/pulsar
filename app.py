@@ -973,11 +973,9 @@ def fetch_all_results_auto(search):
     # Build filter variations to try — searchIds with hash, with id, with both
     filter_variations = []
     if search_hash:
-        filter_variations.append({"searchIds": search_hash})
+        filter_variations.append({"searchIds": [search_hash]})
     if search_id:
-        filter_variations.append({"searchIds": str(search_id)})
-    if search_hash and search_id:
-        filter_variations.append({"searchIds": search_hash, "id": str(search_id)})
+        filter_variations.append({"searchIds": [str(search_id)]})
 
     for filter_value in filter_variations:
         for field_info in ranked[:3]:
