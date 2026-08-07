@@ -132,6 +132,13 @@ def detect_categories():
     values = [v["name"] for v in (enum_data.get("__type") or {}).get("enumValues") or []]
     if not values:
         raise RuntimeError(f'enum "{named["name"]}" retornou vazio.')
+
+    # Plain "Instagram" doesn't actually work on this account — only the Instagram_Public
+    # variant does. Drop the broken one whenever the working variant is also available.
+    upper_values = [v.upper() for v in values]
+    if "INSTAGRAM" in upper_values and any(v.upper().startswith("INSTAGRAM_PUBLIC") for v in values):
+        values = [v for v in values if v.upper() != "INSTAGRAM"]
+
     return values
 
 
@@ -252,9 +259,10 @@ def enrich_names(nodes):
     if not nodes or all(n.get("name") for n in nodes):
         return nodes
     try:
-        all_searches = list_searches()
-        by_hash = {s.get("searchHash"): s.get("name") for s in all_searches if s.get("searchHash")}
-        by_id = {str(s.get("id")): s.get("name") for s in all_searches if s.get("id") is not None}
+        # Force unfiltered call — the folder-filtered path may also lack names
+        all_searches = list_searches(folder_support=None, folder_id=None)
+        by_hash = {s.get("searchHash"): s.get("name") for s in all_searches if s.get("searchHash") and s.get("name")}
+        by_id = {str(s.get("id")): s.get("name") for s in all_searches if s.get("id") is not None and s.get("name")}
     except Exception:
         return nodes
     for n in nodes:
@@ -338,10 +346,12 @@ def fetch_folder_searches(folder_field_name, folder_id):
 
 
 # ---------------- TRAC metadata mutations ----------------
-def create_search(name, categories, boolean_expr, folder_input_field=None, folder_id=None):
+def create_search(name, categories, boolean_expr, folder_input_field=None, folder_id=None, facebook_keywords=None):
     input_obj = {"name": name, "categories": categories, "booleanExpression": boolean_expr}
     if folder_input_field and folder_id:
         input_obj[folder_input_field] = folder_id
+    if facebook_keywords:
+        input_obj["facebookKeywords"] = facebook_keywords
     mutation = """
     mutation CreateBoolTopic($input: CreateBooleanTopicsSearchInput!){
       createBooleanTopicsSearch(input:$input){
@@ -449,6 +459,10 @@ def run_full_historic_flow(placeholder, search, historic_ids, max_wait_preview=3
     last_fetch_check = -fetch_check_every
     last_attempts = []
     last_status_text = "—"
+    debug_placeholder = st.empty()
+    looks_done_streak = 0
+    LOOKS_DONE_HINTS = ("complet", "done", "finish", "ready", "success")
+
     while True:
         elapsed2 = time.time() - started2
         try:
@@ -486,11 +500,28 @@ def run_full_historic_flow(placeholder, search, historic_ids, max_wait_preview=3
                 df, used_field, attempts = pd.DataFrame(), None, []
             last_attempts = attempts
             if not df.empty:
+                debug_placeholder.empty()
                 return "done", df, used_field
+
+            # Pulsar says it's done (COMPLETED/READY/etc.) but the Data Endpoint still won't
+            # give us anything — surface that live instead of silently retrying for up to 2h.
+            status_looks_done = any(h in last_status_text.lower() for h in LOOKS_DONE_HINTS)
+            looks_done_streak = looks_done_streak + 1 if status_looks_done else 0
+            if looks_done_streak >= 2:
+                with debug_placeholder.container():
+                    st.warning(
+                        f'O Pulsar reporta status "{last_status_text}" (parece concluído), mas o Data Endpoint '
+                        "ainda não devolveu registros para nenhum campo testado. Continuando a tentar automaticamente "
+                        "— pode ser só um atraso de sincronização entre os dois serviços."
+                    )
+                    render_fetch_attempts(attempts)
+            else:
+                debug_placeholder.empty()
 
         if elapsed2 > max_wait_collect:
             return "long_wait", last_attempts, last_status_text
         time.sleep(interval)
+
 
 
 
@@ -555,8 +586,32 @@ def list_searches(folder_support=None, folder_id=None):
         nodes{{ id name totalContents startDate status searchHash realtimeStatus {extra_field} }}
       }}
     }}"""
-    data = trac_gql(query, variables)
-    nodes = data["searches"]["nodes"]
+    # The API defaults to page 1 with 10 results. Fetch multiple pages to get all searches.
+    all_nodes = []
+    page = 1
+    while True:
+        page_vars = {**variables, "page": page}
+        page_query = f"""
+        query Searches({var_defs}, $page: Int){{
+          searches({args}, page:$page){{
+            totalCount
+            nodes{{ id name totalContents startDate status searchHash realtimeStatus {extra_field} }}
+          }}
+        }}"""
+        try:
+            data = trac_gql(page_query, page_vars)
+        except Exception:
+            # Some schemas may not accept `page` arg — fall back to single page
+            data = trac_gql(query, variables)
+            all_nodes = data["searches"]["nodes"]
+            break
+        nodes = data["searches"]["nodes"]
+        all_nodes.extend(nodes)
+        total = data["searches"].get("totalCount", 0)
+        if len(all_nodes) >= total or len(nodes) == 0 or page > 50:
+            break
+        page += 1
+    nodes = all_nodes
 
     if (
         folder_id
@@ -838,30 +893,132 @@ def flatten_results(payload, field_name, nodes_key):
     return pd.DataFrame(items)
 
 
+def introspect_filter_input(endpoint):
+    """Get ALL fields of FilterInput so we can see exactly what the Data Endpoint expects."""
+    try:
+        fields = introspect_input_fields("FilterInput", endpoint=endpoint)
+        return {f["name"]: unwrap_named_type(f["type"]).get("name", "?") for f in fields}
+    except Exception:
+        return {}
+
+
+def build_filter_candidates(search, filter_fields):
+    """Given the known fields of FilterInput and the search object, generate every plausible
+    filter dict to try — from most likely to least likely."""
+    hash_val = search.get("searchHash") or search.get("hash")
+    id_val = search.get("id")
+    candidates = []
+
+    # Priority 1: fields that scream "this is where the search hash goes"
+    for field_name in filter_fields:
+        low = field_name.lower()
+        if "hash" in low or low == "search" or low == "searchhash":
+            if hash_val:
+                candidates.append({field_name: hash_val})
+
+    # Priority 2: same fields but with the numeric ID (some APIs accept both)
+    for field_name in filter_fields:
+        low = field_name.lower()
+        if "hash" in low or low == "search":
+            if id_val:
+                candidates.append({field_name: str(id_val)})
+
+    # Priority 3: ID-like fields with the numeric id
+    for field_name in filter_fields:
+        low = field_name.lower()
+        if low in ("id", "searchid", "topicid") or low.endswith("id"):
+            if id_val:
+                candidates.append({field_name: int(id_val) if str(id_val).isdigit() else id_val})
+
+    # Priority 4: ID-like fields with the hash (some APIs are flexible)
+    for field_name in filter_fields:
+        low = field_name.lower()
+        if low in ("id", "searchid"):
+            if hash_val:
+                candidates.append({field_name: hash_val})
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for c in candidates:
+        key = str(sorted(c.items()))
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+    return unique
+
+
 def fetch_all_results_auto(search):
-    """Try the best-ranked candidate fields in order until one returns data successfully.
-    Each attempt keeps the exact query/variables sent, so failures are fully inspectable
-    without needing to re-run anything."""
+    """Introspect FilterInput, generate all plausible filter values, try them against the
+    best-ranked query fields until one returns data. Shows full debug for every attempt."""
     fields = introspect_query_fields(DATA_ENDPOINT)
     ranked = rank_results_fields(DATA_ENDPOINT, fields)
     attempts = []
-    for field_info in ranked[:8]:
-        arg_name, gql_type, arg_value, nested_field = resolve_identifier(DATA_ENDPOINT, field_info, search)
-        if not arg_name:
-            attempts.append({"field": field_info["name"], "message": "nenhum argumento (direto ou aninhado) parece aceitar o id/hash da busca — pulado", "query": None, "variables": None})
-            continue
-        arg_values = {arg_name: {"value": arg_value, "gql_type": gql_type}}
-        query, nodes_key = None, None
-        try:
-            query, nodes_key = build_dynamic_query(DATA_ENDPOINT, field_info["name"], arg_values)
-            variables = {arg_name: arg_value}
-            payload = data_gql(query, variables)
-            df = flatten_results(payload, field_info["name"], nodes_key)
-            if not df.empty:
-                return df, field_info["name"], attempts
-            attempts.append({"field": field_info["name"], "message": "retornou 0 registros", "query": query, "variables": variables})
-        except Exception as e:
-            attempts.append({"field": field_info["name"], "message": str(e), "query": query, "variables": {arg_name: arg_value}})
+
+    # Step 1: discover FilterInput fields
+    filter_fields = introspect_filter_input(DATA_ENDPOINT)
+    filter_candidates = build_filter_candidates(search, filter_fields)
+
+    if not filter_candidates:
+        attempts.append({
+            "field": "(diagnóstico)",
+            "message": f"FilterInput tem estes campos: {filter_fields} — nenhum parece aceitar hash/id da busca",
+            "query": None, "variables": {"search_object": search, "filter_fields": filter_fields},
+        })
+        return pd.DataFrame(), None, attempts
+
+    # Step 2: for each candidate query field, try each filter combination
+    best_field = ranked[0] if ranked else None
+    if not best_field:
+        attempts.append({"field": "(diagnóstico)", "message": "nenhum campo candidato encontrado no schema", "query": None, "variables": None})
+        return pd.DataFrame(), None, attempts
+
+    # Find the filter arg
+    filter_arg = None
+    filter_gql_type = "FilterInput!"
+    for a in best_field["args"]:
+        named = unwrap_named_type(a["type"])
+        if named.get("kind") == "INPUT_OBJECT":
+            filter_arg = a["name"]
+            filter_gql_type = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
+            break
+    if not filter_arg:
+        filter_arg = best_field["args"][0]["name"] if best_field["args"] else "filter"
+
+    for filter_value in filter_candidates:
+        for field_info in ranked[:3]:  # try top 3 fields for each filter combo
+            # check this field also uses a FilterInput-like arg
+            fi_arg = None
+            fi_type = filter_gql_type
+            for a in field_info["args"]:
+                named = unwrap_named_type(a["type"])
+                if named.get("kind") == "INPUT_OBJECT":
+                    fi_arg = a["name"]
+                    fi_type = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
+                    break
+            if not fi_arg:
+                continue
+
+            arg_values = {fi_arg: {"value": filter_value, "gql_type": fi_type}}
+            query, nodes_key = None, None
+            try:
+                query, nodes_key = build_dynamic_query(DATA_ENDPOINT, field_info["name"], arg_values)
+                variables = {fi_arg: filter_value}
+                payload = data_gql(query, variables)
+                df = flatten_results(payload, field_info["name"], nodes_key)
+                if not df.empty:
+                    return df, field_info["name"], attempts
+                attempts.append({"field": field_info["name"], "message": "retornou 0 registros", "query": query, "variables": variables})
+            except Exception as e:
+                attempts.append({"field": field_info["name"], "message": str(e), "query": query, "variables": {fi_arg: filter_value}})
+
+    # Add diagnostic info at the end
+    attempts.append({
+        "field": "(diagnóstico — FilterInput)",
+        "message": f"Campos disponíveis em FilterInput: {filter_fields}",
+        "query": None,
+        "variables": {"search_hash": search.get("searchHash"), "search_id": search.get("id"), "filter_combos_tried": len(filter_candidates)},
+    })
     return pd.DataFrame(), None, attempts
 
 
@@ -1137,6 +1294,15 @@ with tab_new:
         help="Se uma rede der erro de 'not available yet', ela existe no schema mas não está habilitada no seu plano.",
     )
 
+    fb_keywords_raw = ""
+    if any("facebook" in n.lower() for n in networks):
+        fb_keywords_raw = st.text_area(
+            "Combinações de palavras-chave do Facebook (uma combinação por linha, termos separados por vírgula)",
+            placeholder="cryptocurrency, dump\ncryptocurrency, pump\ncryptocurrency, to the moon",
+            height=90,
+            help='Refina a busca no Facebook por pares/combinações de termos, além da booleana geral. Opcional — vira o campo "facebookKeywords" da API.',
+        )
+
     col1, col2 = st.columns(2)
     with col1:
         start = st.date_input("Início do histórico", value=None)
@@ -1198,6 +1364,11 @@ with tab_new:
             progress = st.status("Rodando busca...", expanded=True)
             historic_ids = []
             search = None
+            fb_keywords_parsed = []
+            for line in fb_keywords_raw.splitlines():
+                terms = [t.strip() for t in line.split(",") if t.strip()]
+                if terms:
+                    fb_keywords_parsed.append(terms)
             try:
                 if folder_field:
                     progress.write(f'Criando busca ("{final_name}") na pasta {st.session_state.folder_id}...')
@@ -1205,9 +1376,12 @@ with tab_new:
                     progress.write(f"Criando busca (\"{final_name}\")...")
                 if final_boolean != boolean_expr.strip():
                     progress.write("Aplicando configurações avançadas na booleana...")
+                if fb_keywords_parsed:
+                    progress.write(f"Aplicando {len(fb_keywords_parsed)} combinação(ões) de palavras-chave do Facebook...")
                 search = create_search(
                     final_name, networks, final_boolean,
                     folder_input_field=folder_field, folder_id=st.session_state.folder_id,
+                    facebook_keywords=fb_keywords_parsed,
                 )
                 progress.write(f"✅ Busca criada — hash `{search['searchHash']}`")
 
