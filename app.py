@@ -29,7 +29,7 @@ for key, default in {
     "results_df": None,
     "folder_id": "25",
     "folder_support": None,
-    "auto_track": None,
+    "waiting_for": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -398,70 +398,98 @@ def get_historics_progress(search_id, historic_ids):
 TERMINAL_FAIL = ("fail", "error", "cancelled", "canceled")
 
 
-def wait_for_preview_ready(placeholder, search_id, historic_ids, max_wait=180, interval=4):
-    """Phase 1: the historic must finish computing its preview (the '29K results' count you
-    see in the Pulsar UI before the rocket/launch button lights up) before launchHistoric
-    will actually take effect. Wait for progress to reach ~100 before trying to launch."""
+def run_full_historic_flow(placeholder, search, historic_ids, max_wait_preview=300, max_wait_collect=7200, interval=8, fetch_check_every=20):
+    """One continuous, automatic wait — no clicks, no reruns:
+    1) waits for the preview to finish computing (the '29K results' count in the Pulsar UI),
+    2) launches the historic itself the moment it's ready (the 'rocket'),
+    3) keeps watching the real post-launch progress (with an ETA estimated from its own trend)
+       while periodically probing the Data Endpoint for real fetchable results — a non-empty
+       fetch is the actual ground truth for 'done', the status text is just shown for context.
+    Returns ("done", df, used_field) / ("failed"|"launch_failed", message, None) /
+    ("long_wait", attempts, last_status_text).
+    """
     started = time.time()
+
+    # Phase 1 — preview
     while True:
         elapsed = time.time() - started
         try:
-            progress, statuses = get_historics_progress(search_id, historic_ids)
+            progress, statuses = get_historics_progress(search["id"], historic_ids)
         except Exception as e:
             progress, statuses = None, [str(e)]
 
         statuses_low = [str(s).lower() for s in statuses if s]
-        failed = any(any(k in s for k in TERMINAL_FAIL) for s in statuses_low)
+        if any(any(k in s for k in TERMINAL_FAIL) for s in statuses_low):
+            return "failed", ", ".join(set(str(s) for s in statuses)), None
 
         with placeholder.container():
             st.progress(min(int(progress or 0), 100) / 100)
-            st.caption(f"Calculando preview: {progress:.0f}% · status: {', '.join(set(str(s) for s in statuses)) or '—'}" if progress is not None else f"Preparando preview... ({int(elapsed)}s)")
+            st.caption(
+                f"Calculando preview: {progress:.0f}% · status: {', '.join(set(str(s) for s in statuses)) or '—'}"
+                if progress is not None else f"Preparando preview... ({int(elapsed)}s)"
+            )
 
-        if failed:
-            return "failed", statuses
         if progress is not None and progress >= 99:
-            return "ready", statuses
-        if elapsed > max_wait:
-            return "timeout", statuses
+            break
+        if elapsed > max_wait_preview:
+            break  # generous wait already given — proceed to launch attempt anyway
         time.sleep(interval)
 
+    # Launch (the "rocket")
+    with placeholder.container():
+        st.caption("🚀 Preview pronto — lançando o histórico automaticamente...")
+    try:
+        launch_historic(historic_ids)
+    except Exception as e:
+        return "launch_failed", str(e), None
 
-def wait_for_results_ready(placeholder, search, historic_ids, max_wait=600, interval=20):
-    """Phase 3: show the real post-launch progress bar (the second loading you see on the
-    Pulsar Platform after hitting the rocket) as visual feedback, but don't trust its status
-    text alone to decide 'done' — that burned us once already with 'PREVIEWED'. The actual
-    stop condition is always: did a real fetch from the Data Endpoint come back non-empty."""
-    started = time.time()
-    attempt = 0
+    # Phase 2 — collecting, with ETA, checking the Data Endpoint periodically without stopping the loop
+    started2 = time.time()
+    samples = []
+    last_fetch_check = -fetch_check_every
     last_attempts = []
+    last_status_text = "—"
     while True:
-        elapsed = time.time() - started
-        attempt += 1
-
+        elapsed2 = time.time() - started2
         try:
             progress2, statuses2 = get_historics_progress(search["id"], historic_ids)
         except Exception:
             progress2, statuses2 = None, []
+        if statuses2:
+            last_status_text = ", ".join(set(str(s) for s in statuses2))
+
+        eta_txt = ""
+        if progress2 is not None:
+            samples.append((elapsed2, progress2))
+            if len(samples) >= 2:
+                t0, p0 = samples[0]
+                rate = (progress2 - p0) / max(elapsed2 - t0, 1e-6)
+                if rate > 0.01 and progress2 < 100:
+                    eta_sec = (100 - progress2) / rate
+                    mins = int(eta_sec // 60)
+                    eta_txt = f" · ETA ~{mins} min" if mins >= 1 else " · ETA menos de 1 min"
 
         with placeholder.container():
             if progress2 is not None:
                 st.progress(min(int(progress2), 100) / 100)
-                st.caption(
-                    f"Coletando: {progress2:.0f}% · status: {', '.join(set(str(s) for s in statuses2)) or '—'} "
-                    f"· verificando o Results (tentativa {attempt}, {int(elapsed)}s decorridos)"
-                )
+                st.caption(f"Coletando: {progress2:.0f}%{eta_txt} · status: {last_status_text} · {int(elapsed2)}s decorridos")
             else:
-                st.caption(f"Verificando se os dados já chegaram no Results... (tentativa {attempt}, {int(elapsed)}s decorridos)")
+                st.caption(f"Aguardando a coleta começar... ({int(elapsed2)}s decorridos)")
 
-        try:
-            df, used_field, attempts = fetch_all_results_auto(search)
-        except Exception:
-            df, used_field, attempts = pd.DataFrame(), None, []
-        last_attempts = attempts
-        if not df.empty:
-            return df, used_field
-        if elapsed > max_wait:
-            return pd.DataFrame(), last_attempts
+        # the real Data Endpoint probe is heavier (several GraphQL calls) — only do it every N seconds,
+        # while the lightweight progress/ETA display above keeps updating every `interval`
+        if elapsed2 - last_fetch_check >= fetch_check_every:
+            last_fetch_check = elapsed2
+            try:
+                df, used_field, attempts = fetch_all_results_auto(search)
+            except Exception:
+                df, used_field, attempts = pd.DataFrame(), None, []
+            last_attempts = attempts
+            if not df.empty:
+                return "done", df, used_field
+
+        if elapsed2 > max_wait_collect:
+            return "long_wait", last_attempts, last_status_text
         time.sleep(interval)
 
 
@@ -1229,11 +1257,13 @@ with tab_new:
                     "boolean": final_boolean,
                     "folder_assigned": folder_assigned,
                 }
-                st.session_state.auto_track = {"search": search, "historic_ids": historic_ids} if historic_configured else None
+                st.session_state.waiting_for = (
+                    {"search": search, "historic_ids": historic_ids} if historic_configured else None
+                )
             except Exception as e:
                 progress.update(label="Erro", state="error")
                 st.error(str(e))
-                st.session_state.auto_track = None
+                st.session_state.waiting_for = None
 
     if st.session_state.last_result:
         r = st.session_state.last_result
@@ -1258,51 +1288,38 @@ with tab_new:
             with st.expander("Booleana final enviada (com configurações avançadas aplicadas)"):
                 st.code(r["boolean"], language=None)
 
-        track = st.session_state.get("auto_track")
+        track = st.session_state.get("waiting_for")
         if track:
             st.divider()
-            st.subheader("Progresso do histórico")
+            st.subheader("Progresso completo — preview, lançamento e coleta")
             search_obj = track["search"]
             historic_ids = track["historic_ids"]
-            st.session_state.auto_track = None  # only run this blocking flow once per creation
+            st.session_state.waiting_for = None  # this single call handles the whole flow end-to-end
 
             placeholder = st.empty()
-            preview_outcome, preview_statuses = wait_for_preview_ready(placeholder, search_obj["id"], historic_ids)
+            outcome, payload, extra = run_full_historic_flow(placeholder, search_obj, historic_ids)
 
-            if preview_outcome == "failed":
-                st.error(f"O preview falhou no Pulsar (status: {', '.join(set(str(s) for s in preview_statuses))}). Confira no Pulsar Platform.")
-            else:
-                if preview_outcome == "timeout":
-                    st.warning("Preview demorou mais que o esperado — tentando lançar mesmo assim.")
-
-                with placeholder.container():
-                    st.caption("🚀 Preview pronto — lançando o histórico agora...")
-                try:
-                    launch_historic(historic_ids)
-                    st.success("✅ Histórico lançado (equivalente a apertar o foguete no Pulsar Platform).")
-                except Exception as e:
-                    st.error(f"O preview terminou mas o lançamento falhou: {e}")
-
+            if outcome == "done":
+                df, used_field = payload, extra
+                st.session_state.results_df = df
+                st.session_state.results_field_used = used_field
+                st.success(f"{len(df)} registro(s) carregado(s) via `{used_field}`.")
                 st.divider()
-                st.subheader("Aguardando os dados aparecerem no Results")
-                placeholder2 = st.empty()
-                df, used_field_or_attempts = wait_for_results_ready(placeholder2, search_obj, historic_ids)
-
-                if isinstance(used_field_or_attempts, str):
-                    st.session_state.results_df = df
-                    st.session_state.results_field_used = used_field_or_attempts
-                    st.success(f"{len(df)} registro(s) carregado(s) via `{used_field_or_attempts}`.")
-                    st.divider()
-                    render_dashboard(df, key_prefix="auto_")
-                else:
-                    st.warning(
-                        "Ainda não consegui trazer resultados depois de esperar. Isso é normal para períodos "
-                        "grandes — ou pode indicar algo no schema que vale eu ajustar."
-                    )
-                    if used_field_or_attempts:
-                        render_fetch_attempts(used_field_or_attempts)
-                    if st.button("🔄 Tentar de novo agora", key="retry_after_wait"):
-                        st.rerun()
+                render_dashboard(df, key_prefix="auto_")
+            elif outcome == "failed":
+                st.error(f"O preview falhou no Pulsar (status: {payload}). Confira no Pulsar Platform.")
+            elif outcome == "launch_failed":
+                st.error(f"O preview terminou mas o lançamento (foguete) falhou: {payload}")
+            else:  # long_wait
+                attempts, last_status_text = payload, extra
+                st.info(
+                    f"Ainda coletando depois de bastante tempo (último status: {last_status_text}). "
+                    'Isso pode ser normal para períodos grandes. Você pode ir na aba "📊 Resultados" a qualquer '
+                    'momento, escolher esse mesmo estudo e clicar em "Puxar TUDO desse estudo" — funciona assim '
+                    "que os dados estiverem prontos, sem precisar recriar nada."
+                )
+                if attempts:
+                    render_fetch_attempts(attempts)
         elif r.get("historic"):
             st.caption('Vá até a aba "📊 Resultados" para puxar o feed e montar o dashboard.')
 
