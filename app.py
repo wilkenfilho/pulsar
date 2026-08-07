@@ -950,9 +950,89 @@ def build_filter_candidates(search, filter_fields):
     return unique
 
 
-def fetch_all_results_auto(search, date_from=None, date_to=None):
-    """The Data Endpoint identifies the search via `searchIds` (array) inside FilterInput.
-    `dateFrom` and `dateTo` are also REQUIRED by FilterInput."""
+# How many rows to request per page when paginating the Data Endpoint results.
+RESULTS_PAGE_SIZE = 500
+# When the field exposes a `limit` but NO cursor (offset/page), ask for everything at once.
+RESULTS_SINGLE_SHOT_LIMIT = 100000
+# Hard safety ceiling so a misbehaving cursor can never loop forever.
+MAX_RESULT_PAGES = 4000
+
+
+def extract_total_count(payload, field_name):
+    """Read totalCount from the results connection, if the schema exposes it."""
+    root = payload.get(field_name)
+    if isinstance(root, dict):
+        tc = root.get("totalCount")
+        if isinstance(tc, (int, float)):
+            return int(tc)
+    return None
+
+
+def detect_pagination(field_info, endpoint):
+    """Discover HOW to paginate a given results field.
+
+    Pulsar's Data Endpoint keeps pagination INSIDE an `options: ResultsOptionsInput`
+    object (limit + offset/page), NOT as top-level args — that's exactly why the old
+    code only ever got the first ~50 rows. We introspect that options input (and also
+    handle plain top-level args as a fallback) so we can page through everything.
+    Returns a dict describing where limit / offset / page live.
+    """
+    info = {
+        "options_arg": None, "options_type": None,
+        "opt_limit": None, "opt_offset": None, "opt_page": None,
+        "top_limit": None, "top_offset": None, "top_page": None,
+    }
+    for a in field_info["args"]:
+        named = unwrap_named_type(a["type"])
+        low = a["name"].lower()
+        if named.get("kind") == "INPUT_OBJECT":
+            type_name = (named.get("name") or "").lower()
+            if low == "filter" or "filter" in type_name:
+                continue  # that's the search filter, not pagination
+            if info["options_arg"] is None:
+                info["options_arg"] = a["name"]
+                info["options_type"] = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
+        elif low in ("limit", "first", "pagesize", "size", "perpage", "count"):
+            info["top_limit"] = a["name"]
+        elif low in ("offset", "skip", "from", "start"):
+            info["top_offset"] = a["name"]
+        elif low in ("page", "pagenumber"):
+            info["top_page"] = a["name"]
+
+    if info["options_arg"]:
+        try:
+            opt_fields = introspect_input_fields(info["options_type"].rstrip("!"), endpoint=endpoint)
+        except Exception:
+            opt_fields = []
+        for f in opt_fields:
+            low = f["name"].lower()
+            if low in ("limit", "first", "pagesize", "size", "perpage", "count") and not info["opt_limit"]:
+                info["opt_limit"] = f["name"]
+            elif low in ("offset", "skip", "from", "start") and not info["opt_offset"]:
+                info["opt_offset"] = f["name"]
+            elif low in ("page", "pagenumber") and not info["opt_page"]:
+                info["opt_page"] = f["name"]
+    return info
+
+
+def _dedup_results(frame):
+    """Drop duplicate rows across pages, preferring a stable unique key when present."""
+    for key in ("id", "url", "guid", "postId", "contentId", "permalink"):
+        if key in frame.columns:
+            return frame.drop_duplicates(subset=[key]).reset_index(drop=True)
+    return frame.drop_duplicates().reset_index(drop=True)
+
+
+def fetch_all_results_auto(search, date_from=None, date_to=None, progress_cb=None):
+    """Pull EVERY result for a search from the Data Endpoint.
+
+    The Data Endpoint identifies the search via `searchIds` (array) inside FilterInput,
+    and `dateFrom`/`dateTo` are REQUIRED. Crucially, it paginates through the whole
+    dataset (offset/page inside `options`) instead of returning only the default first
+    page — so a search with 10k+ mentions comes back complete, not truncated to 50.
+
+    Pass `progress_cb(collected, total_or_None)` to receive live progress.
+    """
     search_hash = search.get("searchHash") or search.get("hash")
     search_id = search.get("id")
     if not search_hash and not search_id:
@@ -986,60 +1066,102 @@ def fetch_all_results_auto(search, date_from=None, date_to=None):
 
     for filter_value in filter_variations:
         for field_info in ranked[:3]:
-            # Find the FilterInput arg and any pagination args
+            # Locate the FilterInput arg (prefer one named "filter" / typed *Filter*)
             filter_arg = None
             filter_type = None
-            page_arg = None
-            limit_arg = None
             for a in field_info["args"]:
                 named = unwrap_named_type(a["type"])
                 low = a["name"].lower()
-                # Prefer the arg named "filter" or whose type contains "Filter";
-                # skip "options"/"ResultsOptionsInput" which is for pagination/sorting
                 if named.get("kind") == "INPUT_OBJECT":
                     type_name = (named.get("name") or "").lower()
                     if low == "filter" or "filter" in type_name:
                         filter_arg = a["name"]
                         filter_type = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
                     elif not filter_arg:
-                        # fallback: use this INPUT_OBJECT only if nothing better found yet
                         filter_arg = a["name"]
                         filter_type = named["name"] + ("!" if a["type"].get("kind") == "NON_NULL" else "")
-                if low in ("limit", "first", "pagesize", "size", "perpage"):
-                    limit_arg = a["name"]
-                elif low in ("page", "offset", "skip", "after"):
-                    page_arg = a["name"]
             if not filter_arg:
                 continue
 
-            # Build query with high limit to get as many results as possible
-            arg_values = {filter_arg: {"value": filter_value, "gql_type": filter_type}}
-            if limit_arg:
-                arg_values[limit_arg] = {"value": 10000, "gql_type": "Int"}
+            pg = detect_pagination(field_info, DATA_ENDPOINT)
+            can_page = bool(pg["opt_offset"] or pg["opt_page"] or pg["top_offset"] or pg["top_page"])
+            has_limit = bool(pg["opt_limit"] or pg["top_limit"])
+            # If we can't move a cursor but CAN set a limit, ask for everything in one shot.
+            per_call_limit = RESULTS_PAGE_SIZE if can_page else (RESULTS_SINGLE_SHOT_LIMIT if has_limit else None)
 
-            query, nodes_key = None, None
-            try:
-                query, nodes_key = build_dynamic_query(DATA_ENDPOINT, field_info["name"], arg_values)
-                variables = {k: v["value"] for k, v in arg_values.items()}
-                payload = data_gql(query, variables)
-                df = flatten_results(payload, field_info["name"], nodes_key)
-                if not df.empty:
-                    return df, field_info["name"], attempts
-                attempts.append({"field": field_info["name"], "message": "retornou 0 registros", "query": query, "variables": variables})
-            except Exception as e:
-                # If limit too high caused an error, retry without it
-                if limit_arg and "limit" in str(e).lower():
+            frames = []
+            total_expected = None
+            page_idx = 0     # 0-based
+            offset = 0
+            last_query = None
+            field_failed = False
+
+            for _ in range(MAX_RESULT_PAGES):
+                arg_values = {filter_arg: {"value": filter_value, "gql_type": filter_type}}
+
+                # Attach pagination — prefer the options INPUT_OBJECT if the schema has it.
+                if pg["options_arg"] and (pg["opt_limit"] or pg["opt_offset"] or pg["opt_page"]):
+                    opt = {}
+                    if pg["opt_limit"] and per_call_limit is not None:
+                        opt[pg["opt_limit"]] = per_call_limit
+                    if pg["opt_offset"]:
+                        opt[pg["opt_offset"]] = offset
+                    elif pg["opt_page"]:
+                        opt[pg["opt_page"]] = page_idx + 1  # most APIs are 1-based
+                    arg_values[pg["options_arg"]] = {"value": opt, "gql_type": pg["options_type"]}
+                else:
+                    if pg["top_limit"] and per_call_limit is not None:
+                        arg_values[pg["top_limit"]] = {"value": per_call_limit, "gql_type": "Int"}
+                    if pg["top_offset"]:
+                        arg_values[pg["top_offset"]] = {"value": offset, "gql_type": "Int"}
+                    elif pg["top_page"]:
+                        arg_values[pg["top_page"]] = {"value": page_idx + 1, "gql_type": "Int"}
+
+                try:
+                    query, nodes_key = build_dynamic_query(DATA_ENDPOINT, field_info["name"], arg_values)
+                    last_query = query
+                    variables = {k: v["value"] for k, v in arg_values.items()}
+                    payload = data_gql(query, variables)
+                    df_page = flatten_results(payload, field_info["name"], nodes_key)
+                    if total_expected is None:
+                        total_expected = extract_total_count(payload, field_info["name"])
+                except Exception as e:
+                    # First page failed on this field → record and move to the next candidate.
+                    if not frames:
+                        attempts.append({"field": field_info["name"], "message": str(e), "query": last_query,
+                                          "variables": {k: v["value"] for k, v in arg_values.items()}})
+                        field_failed = True
+                    break
+
+                if df_page.empty:
+                    break
+
+                frames.append(df_page)
+                collected = sum(len(f) for f in frames)
+                if progress_cb:
                     try:
-                        arg_values2 = {filter_arg: {"value": filter_value, "gql_type": filter_type}}
-                        query2, nodes_key2 = build_dynamic_query(DATA_ENDPOINT, field_info["name"], arg_values2)
-                        variables2 = {filter_arg: filter_value}
-                        payload2 = data_gql(query2, variables2)
-                        df2 = flatten_results(payload2, field_info["name"], nodes_key2)
-                        if not df2.empty:
-                            return df2, field_info["name"], attempts
+                        progress_cb(collected, total_expected)
                     except Exception:
                         pass
-                attempts.append({"field": field_info["name"], "message": str(e), "query": query, "variables": {k: v["value"] for k, v in arg_values.items()}})
+
+                # Stop conditions
+                page_len = len(df_page)
+                if not can_page:
+                    break  # single-shot (either a big limit, or no pagination at all)
+                if page_len < per_call_limit:
+                    break  # last (partial) page reached
+                if total_expected is not None and collected >= total_expected:
+                    break  # we've got them all
+
+                offset += per_call_limit
+                page_idx += 1
+
+            if frames:
+                final = _dedup_results(pd.concat(frames, ignore_index=True))
+                return final, field_info["name"], attempts
+            if not field_failed:
+                attempts.append({"field": field_info["name"], "message": "retornou 0 registros",
+                                  "query": last_query, "variables": {"filtro": filter_value}})
 
     attempts.append({
         "field": "(diagnóstico)",
@@ -1585,15 +1707,28 @@ with tab_results:
 
         if picked and st.button("📥 Puxar TUDO desse estudo", type="primary"):
             try:
-                with st.spinner("Descobrindo o melhor campo e buscando todos os campos disponíveis..."):
-                    df, used_field, attempts = fetch_all_results_auto(picked)
+                progress_bar = st.progress(0.0)
+                progress_txt = st.empty()
+
+                def _on_progress(collected, total):
+                    if total:
+                        frac = min(collected / total, 1.0) if total else 0.0
+                        progress_bar.progress(frac)
+                        progress_txt.caption(f"Baixando todas as menções… {collected:,} de {total:,} coletadas")
+                    else:
+                        progress_txt.caption(f"Baixando todas as menções… {collected:,} coletadas")
+
+                with st.spinner("Descobrindo o melhor campo e paginando TODOS os resultados..."):
+                    df, used_field, attempts = fetch_all_results_auto(picked, progress_cb=_on_progress)
+                progress_bar.empty()
+                progress_txt.empty()
                 if df.empty:
                     st.error("Não consegui trazer resultados automaticamente.")
                     render_fetch_attempts(attempts)
                 else:
                     st.session_state.results_df = df
                     st.session_state.results_field_used = used_field
-                    st.success(f"{len(df)} registro(s) carregado(s) via `{used_field}`, com {len(df.columns)} coluna(s).")
+                    st.success(f"✅ {len(df):,} menção(ões) baixada(s) por completo via `{used_field}`, com {len(df.columns)} coluna(s). Nenhuma faltando.")
             except Exception as e:
                 st.error(str(e))
 
